@@ -1,0 +1,28 @@
+<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="DiskTree logo">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4F46E5"/>
+      <stop offset="1" stop-color="#2563EB"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app-icon rounded square -->
+  <rect x="104" y="104" width="816" height="816" rx="184" fill="url(#bg)"/>
+
+  <!-- treemap tiles (region 176..848), mostly white with amber + teal accents -->
+  <g>
+    <!-- big block, top-left -->
+    <rect x="176" y="176" width="330" height="318" rx="16" fill="#FFFFFF" fill-opacity="0.96"/>
+    <!-- top-right -->
+    <rect x="524" y="176" width="324" height="150" rx="16" fill="#FFFFFF" fill-opacity="0.82"/>
+    <!-- amber accent = reclaimable cache -->
+    <rect x="524" y="344" width="324" height="150" rx="16" fill="#FBBF24"/>
+    <!-- teal accent, tall left-bottom -->
+    <rect x="176" y="512" width="214" height="336" rx="16" fill="#2DD4BF"/>
+    <!-- small stack -->
+    <rect x="408" y="512" width="98" height="160" rx="16" fill="#FFFFFF" fill-opacity="0.90"/>
+    <rect x="408" y="690" width="98" height="158" rx="16" fill="#FFFFFF" fill-opacity="0.70"/>
+    <!-- big block, bottom-right -->
+    <rect x="524" y="512" width="324" height="336" rx="16" fill="#FFFFFF" fill-opacity="0.88"/>
+  </g>
+</svg>

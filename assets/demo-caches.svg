@@ -1,0 +1,115 @@
+<svg viewBox="0 0 1180 724" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <clipPath id="win"><rect x="0" y="0" width="1180" height="724" rx="12"/></clipPath>
+  </defs>
+  <g clip-path="url(#win)">
+    <rect x="0" y="0" width="1180" height="724" fill="#1e1f22"/>
+
+    <!-- title bar -->
+    <rect x="0" y="0" width="1180" height="38" fill="#2b2d30"/>
+    <circle cx="22" cy="19" r="6" fill="#ff5f57"/>
+    <circle cx="42" cy="19" r="6" fill="#febc2e"/>
+    <circle cx="62" cy="19" r="6" fill="#28c840"/>
+    <text x="590" y="24" text-anchor="middle" fill="#c7c9cc" font-size="13" font-weight="600">DiskScour</text>
+
+    <!-- toolbar -->
+    <g font-size="13">
+      <text x="20" y="64" fill="#8b9096" font-weight="700">DiskScour</text>
+      <text x="108" y="64" fill="#9aa0a6">Folder:</text>
+      <rect x="158" y="50" width="430" height="22" rx="4" fill="#1a1b1e" stroke="#4a4d51"/>
+      <text x="168" y="65" fill="#d7dade" font-family="Menlo, monospace" font-size="12">/Users/you/Code</text>
+      <rect x="598" y="50" width="74" height="22" rx="5" fill="#3a3d41"/><text x="635" y="65" text-anchor="middle" fill="#c7c9cc">Choose…</text>
+      <rect x="680" y="50" width="52" height="22" rx="5" fill="#3a3d41"/><text x="706" y="65" text-anchor="middle" fill="#c7c9cc">Scan</text>
+      <rect x="740" y="50" width="56" height="22" rx="5" fill="#3a3d41"/><text x="768" y="65" text-anchor="middle" fill="#c7c9cc">Home</text>
+    </g>
+
+    <!-- tabs -->
+    <g font-size="13">
+      <text x="22" y="96" fill="#9aa0a6">Tree</text>
+      <text x="70" y="96" fill="#9aa0a6">Treemap</text>
+      <rect x="138" y="82" width="120" height="20" rx="4" fill="#2f6fb3"/>
+      <text x="148" y="96" fill="#ffffff">Dev caches (31)</text>
+    </g>
+
+    <!-- action bar -->
+    <g font-size="13">
+      <text x="20" y="126" fill="#ffffff" font-weight="700" font-size="15">36.2 GB reclaimable</text>
+      <rect x="200" y="113" width="74" height="20" rx="5" fill="#3a3d41"/><text x="237" y="127" text-anchor="middle" fill="#c7c9cc" font-size="12">Select all</text>
+      <rect x="282" y="113" width="84" height="20" rx="5" fill="#3a3d41"/><text x="324" y="127" text-anchor="middle" fill="#c7c9cc" font-size="12">Select none</text>
+      <rect x="918" y="111" width="244" height="24" rx="6" fill="#c0392b"/>
+      <text x="1040" y="127" text-anchor="middle" fill="#ffffff" font-size="12" font-weight="600">Move 24.0 GB selected to Trash</text>
+    </g>
+    <line x1="16" y1="144" x2="1164" y2="144" stroke="#34373b"/>
+
+    <!-- Rust group -->
+    <text x="20" y="167" fill="#e3e5e8" font-size="13" font-weight="600">▾  Rust  —  24.0 GB (5)</text>
+    <g font-size="12.5" font-family="Menlo, monospace">
+      <rect x="40" y="178" width="13" height="13" rx="3" fill="#2f6fb3"/><rect x="62" y="179" width="11" height="11" rx="2" fill="#ce422b"/>
+      <text x="84" y="189" fill="#cfd2d6">9.8 GB</text>
+      <text x="170" y="189" fill="#d7dade">api-server/target</text>
+      <text x="430" y="189" fill="#7c8288">cargo build output (cargo build)</text>
+
+      <rect x="40" y="198" width="13" height="13" rx="3" fill="#2f6fb3"/><rect x="62" y="199" width="11" height="11" rx="2" fill="#ce422b"/>
+      <text x="84" y="209" fill="#cfd2d6">6.4 GB</text>
+      <text x="170" y="209" fill="#d7dade">data-pipeline/target</text>
+      <text x="430" y="209" fill="#7c8288">cargo build output (cargo build)</text>
+
+      <rect x="40" y="218" width="13" height="13" rx="3" fill="#2f6fb3"/><rect x="62" y="219" width="11" height="11" rx="2" fill="#ce422b"/>
+      <text x="84" y="229" fill="#cfd2d6">4.2 GB</text>
+      <text x="170" y="229" fill="#d7dade">cli-tools/target</text>
+      <text x="430" y="229" fill="#7c8288">cargo build output (cargo build)</text>
+
+      <rect x="40" y="238" width="13" height="13" rx="3" fill="#2f6fb3"/><rect x="62" y="239" width="11" height="11" rx="2" fill="#ce422b"/>
+      <text x="84" y="249" fill="#cfd2d6">2.0 GB</text>
+      <text x="170" y="249" fill="#d7dade">diskscour/target</text>
+      <text x="430" y="249" fill="#7c8288">cargo build output (cargo build)</text>
+
+      <rect x="40" y="258" width="13" height="13" rx="3" fill="#2f6fb3"/><rect x="62" y="259" width="11" height="11" rx="2" fill="#ce422b"/>
+      <text x="84" y="269" fill="#cfd2d6">1.6 GB</text>
+      <text x="170" y="269" fill="#d7dade">game-engine/target</text>
+      <text x="430" y="269" fill="#7c8288">cargo build output (cargo build)</text>
+    </g>
+
+    <!-- JS group -->
+    <text x="20" y="299" fill="#e3e5e8" font-size="13" font-weight="600">▾  JavaScript / TypeScript  —  12.2 GB (26)</text>
+    <g font-size="12.5" font-family="Menlo, monospace">
+      <rect x="40" y="310" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="311" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="321" fill="#cfd2d6">1.4 GB</text>
+      <text x="170" y="321" fill="#d7dade">web-app/node_modules</text>
+      <text x="470" y="321" fill="#7c8288">npm/yarn/pnpm packages — reinstall with install</text>
+
+      <rect x="40" y="330" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="331" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="341" fill="#cfd2d6">1.1 GB</text>
+      <text x="170" y="341" fill="#d7dade">admin-dashboard/node_modules</text>
+      <text x="540" y="341" fill="#7c8288">npm/yarn/pnpm packages — reinstall with install</text>
+
+      <rect x="40" y="350" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="351" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="361" fill="#cfd2d6">980.0 MB</text>
+      <text x="190" y="361" fill="#d7dade">web-app/.next</text>
+      <text x="370" y="361" fill="#7c8288">Next.js build output</text>
+
+      <rect x="40" y="370" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="371" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="381" fill="#cfd2d6">840.0 MB</text>
+      <text x="190" y="381" fill="#d7dade">marketing-site/node_modules</text>
+      <text x="560" y="381" fill="#7c8288">npm/yarn/pnpm packages — reinstall with install</text>
+
+      <rect x="40" y="390" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="391" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="401" fill="#cfd2d6">620.0 MB</text>
+      <text x="190" y="401" fill="#d7dade">design-system/node_modules</text>
+      <text x="560" y="401" fill="#7c8288">npm/yarn/pnpm packages — reinstall with install</text>
+
+      <rect x="40" y="410" width="13" height="13" rx="3" fill="#3a3d41" stroke="#5a5d61"/><rect x="62" y="411" width="11" height="11" rx="2" fill="#f7df1e"/>
+      <text x="84" y="421" fill="#cfd2d6">510.0 MB</text>
+      <text x="190" y="421" fill="#d7dade">docs-site/.next</text>
+      <text x="370" y="421" fill="#7c8288">Next.js build output</text>
+
+      <text x="84" y="445" fill="#62676d">… 20 more</text>
+    </g>
+
+    <!-- bottom status -->
+    <line x1="0" y1="688" x2="1180" y2="688" stroke="#34373b"/>
+    <text x="20" y="709" fill="#9aa0a6" font-size="12.5">41.8 GB across 612,481 files in 7.3s  ·  36.2 GB reclaimable in dev caches</text>
+    <text x="1160" y="709" text-anchor="end" fill="#9aa0a6" font-size="12.5">Disk: 28.4 GB free of 500.0 GB</text>
+  </g>
+  <rect x="0.5" y="0.5" width="1179" height="723" rx="12" fill="none" stroke="#3a3d41"/>
+</svg>

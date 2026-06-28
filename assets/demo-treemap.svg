@@ -1,0 +1,67 @@
+<svg viewBox="0 0 1180 724" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs><clipPath id="win"><rect x="0" y="0" width="1180" height="724" rx="12"/></clipPath></defs>
+  <g clip-path="url(#win)">
+    <rect x="0" y="0" width="1180" height="724" fill="#1e1f22"/>
+
+    <!-- title bar -->
+    <rect x="0" y="0" width="1180" height="38" fill="#2b2d30"/>
+    <circle cx="22" cy="19" r="6" fill="#ff5f57"/><circle cx="42" cy="19" r="6" fill="#febc2e"/><circle cx="62" cy="19" r="6" fill="#28c840"/>
+    <text x="590" y="24" text-anchor="middle" fill="#c7c9cc" font-size="13" font-weight="600">DiskScour</text>
+
+    <!-- toolbar -->
+    <g font-size="13">
+      <text x="20" y="64" fill="#8b9096" font-weight="700">DiskScour</text>
+      <text x="108" y="64" fill="#9aa0a6">Folder:</text>
+      <rect x="158" y="50" width="430" height="22" rx="4" fill="#1a1b1e" stroke="#4a4d51"/>
+      <text x="168" y="65" fill="#d7dade" font-family="Menlo, monospace" font-size="12">/Users/you/Code</text>
+      <rect x="598" y="50" width="74" height="22" rx="5" fill="#3a3d41"/><text x="635" y="65" text-anchor="middle" fill="#c7c9cc">Choose…</text>
+      <rect x="680" y="50" width="52" height="22" rx="5" fill="#3a3d41"/><text x="706" y="65" text-anchor="middle" fill="#c7c9cc">Scan</text>
+      <rect x="740" y="50" width="56" height="22" rx="5" fill="#3a3d41"/><text x="768" y="65" text-anchor="middle" fill="#c7c9cc">Home</text>
+    </g>
+
+    <!-- tabs -->
+    <g font-size="13">
+      <text x="22" y="96" fill="#9aa0a6">Tree</text>
+      <rect x="62" y="82" width="74" height="20" rx="4" fill="#2f6fb3"/><text x="72" y="96" fill="#ffffff">Treemap</text>
+      <text x="150" y="96" fill="#9aa0a6">Dev caches (31)</text>
+    </g>
+
+    <!-- breadcrumb -->
+    <g font-size="13">
+      <rect x="16" y="110" width="34" height="20" rx="5" fill="#3a3d41"/><text x="33" y="124" text-anchor="middle" fill="#8b9096">Up</text>
+      <text x="62" y="124" fill="#6aa3e0">Code</text>
+      <text x="1164" y="124" text-anchor="end" fill="#e3e5e8" font-weight="700">41.8 GB</text>
+    </g>
+    <line x1="16" y1="140" x2="1164" y2="140" stroke="#34373b"/>
+
+    <!-- treemap tiles -->
+    <g font-size="13" font-family="-apple-system, Helvetica, sans-serif">
+      <!-- data-platform (big) -->
+      <rect x="16" y="148" width="812" height="560" rx="3" fill="#9fc6e8"/>
+      <text x="26" y="167" fill="#13314a" font-weight="600">data-platform  14.0 GB</text>
+
+      <!-- api-server -->
+      <rect x="832" y="148" width="332" height="206" rx="3" fill="#e8c39f"/>
+      <text x="842" y="167" fill="#4a3613" font-weight="600">api-server  10.5 GB</text>
+
+      <!-- web-app -->
+      <rect x="832" y="358" width="332" height="150" rx="3" fill="#e8a9bf"/>
+      <text x="842" y="377" fill="#4a1325" font-weight="600">web-app  6.8 GB</text>
+
+      <!-- admin-dashboard -->
+      <rect x="832" y="512" width="332" height="110" rx="3" fill="#d3e0a0"/>
+      <text x="842" y="529" fill="#2c3a13" font-weight="600">admin-dashboard  3.2 GB</text>
+
+      <!-- bottom row -->
+      <rect x="832" y="626" width="160" height="82" rx="3" fill="#e0a9d8"/>
+      <text x="842" y="643" fill="#3a134a" font-size="12" font-weight="600">diskscour  2.1 GB</text>
+
+      <rect x="996" y="626" width="168" height="42" rx="3" fill="#9fe0d8"/>
+      <text x="1006" y="643" fill="#134a40" font-size="11" font-weight="600">design-system  1.4 GB</text>
+
+      <rect x="996" y="672" width="168" height="36" rx="3" fill="#b0a9e0"/>
+      <text x="1006" y="687" fill="#23134a" font-size="11" font-weight="600">docs-site  1.0 GB</text>
+    </g>
+  </g>
+  <rect x="0.5" y="0.5" width="1179" height="723" rx="12" fill="none" stroke="#3a3d41"/>
+</svg>

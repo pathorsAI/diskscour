@@ -1,0 +1,33 @@
+[package]
+name = "diskscour"
+version = "0.1.0"
+edition = "2024"
+description = "Fast macOS disk-usage analyzer with a tree browser, treemap, and one-click cleanup of regenerable dev/build caches."
+authors = ["Pathors"]
+license = "MIT"
+repository = "https://github.com/pathorsAI/diskscour"
+keywords = ["disk", "treemap", "cleanup", "macos", "gui"]
+categories = ["gui", "filesystem"]
+
+[dependencies]
+# Trimmed to the minimum: native glow renderer + built-in fonts only.
+# (drops wayland/x11/accesskit/web-screen-reader defaults — not needed on macOS)
+eframe = { version = "0.33.3", default-features = false, features = ["glow", "default_fonts"] }
+jwalk = "0.8.1"
+# core trash::delete only — drops the chrono dependency pulled by defaults
+trash = { version = "5.2.6", default-features = false }
+
+[profile.release]
+opt-level = "s"   # optimize for size; scan is I/O-bound so this costs ~nothing
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Optional: `cargo install cargo-bundle && cargo bundle --release` builds DiskScour.app
+[package.metadata.bundle]
+name = "DiskScour"
+identifier = "com.pathors.diskscour"
+short_description = "Disk-usage analyzer with dev-cache cleanup"
+category = "public.app-category.utilities"
+icon = ["assets/icon.icns"]

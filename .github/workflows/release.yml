@@ -1,0 +1,63 @@
+name: Release
+
+# Bump `version` in Cargo.toml and push to main → CI builds the universal macOS
+# app and publishes a GitHub Release tagged v<version>. No manual builds.
+# (Or trigger a rebuild of the current version manually from the Actions tab.)
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="$(grep -m1 '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "v$VERSION already released — skipping."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$VERSION not released yet — will build & publish."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --release
+      - name: Bundle universal app
+        env:
+          UNIVERSAL: "1"
+        run: ./scripts/bundle-mac.sh
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.check.outputs.version }}
+          name: DiskScour v${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          append_body: true
+          body: |
+            ### Install (macOS, universal — Apple Silicon + Intel)
+            1. Download `DiskScour-v${{ needs.check.outputs.version }}-macos.zip` below and unzip it.
+            2. Move **DiskScour.app** to `/Applications`.
+            3. First launch: right-click the app → **Open** (it's unsigned), or run
+               `xattr -dr com.apple.quarantine /Applications/DiskScour.app`.
+          files: dist/DiskScour-v${{ needs.check.outputs.version }}-macos.zip
