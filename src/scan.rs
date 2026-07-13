@@ -13,6 +13,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How often to publish an intermediate snapshot while a scan is running.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Live progress shared with the UI thread during a scan.
 #[derive(Default)]
@@ -23,6 +27,7 @@ pub struct ScanProgress {
 }
 
 /// One node in the size tree (file or directory).
+#[derive(Clone)]
 pub struct Node {
     pub name: String,
     /// Allocated bytes: self size for files, aggregated for directories.
@@ -148,8 +153,33 @@ fn new_dir(name: String) -> Node {
     }
 }
 
-/// Scan `root`, reporting progress via `progress`, and return the size tree.
+/// Scan `root`, reporting progress via `progress`, and return the final size tree.
 pub fn scan(root: PathBuf, progress: Arc<ScanProgress>) -> Tree {
+    scan_impl(root, progress, |_| {}, None)
+}
+
+/// Like [`scan`], but invokes `on_snapshot` periodically (every
+/// [`SNAPSHOT_INTERVAL`]) with a browsable snapshot of the tree built so far, so
+/// the UI can show results as they are discovered. Snapshot node indices match
+/// the returned final tree (the arena is append-only), so index-keyed UI state
+/// stays valid across refreshes.
+pub fn scan_streaming(
+    root: PathBuf,
+    progress: Arc<ScanProgress>,
+    on_snapshot: impl FnMut(Tree),
+) -> Tree {
+    scan_impl(root, progress, on_snapshot, Some(SNAPSHOT_INTERVAL))
+}
+
+/// Shared scan implementation. When `interval` is `Some`, a snapshot is published
+/// via `on_snapshot` no more often than that interval; when `None`, snapshots are
+/// never built (so non-streaming callers pay no clone/aggregate cost).
+fn scan_impl(
+    root: PathBuf,
+    progress: Arc<ScanProgress>,
+    mut on_snapshot: impl FnMut(Tree),
+    interval: Option<Duration>,
+) -> Tree {
     use jwalk::WalkDirGeneric;
 
     let prog = progress.clone();
@@ -191,6 +221,7 @@ pub fn scan(root: PathBuf, progress: Arc<ScanProgress>) -> Tree {
             i
         };
 
+    let mut last_snapshot = Instant::now();
     for entry in walk {
         let entry = match entry {
             Ok(e) => e,
@@ -211,6 +242,16 @@ pub fn scan(root: PathBuf, progress: Arc<ScanProgress>) -> Tree {
             nodes[idx].parent = Some(pidx);
             nodes[pidx].children.push(idx);
         }
+
+        // Periodically hand the UI a browsable snapshot of what we have so far.
+        // Skipped entirely (no clone/aggregate cost) for non-streaming callers.
+        if let Some(iv) = interval
+            && last_snapshot.elapsed() >= iv
+            && let Some(&ri) = index.get(&root)
+        {
+            on_snapshot(snapshot(&nodes, ri, &root));
+            last_snapshot = Instant::now();
+        }
     }
 
     if nodes.is_empty() {
@@ -228,6 +269,21 @@ pub fn scan(root: PathBuf, progress: Arc<ScanProgress>) -> Tree {
         nodes,
         root: root_idx,
         root_path: root,
+    }
+}
+
+/// Build an immutable snapshot of the in-progress arena for the UI: clone the
+/// nodes (so scanning keeps mutating the originals), then aggregate sizes and
+/// sort children on the copy. Directory self-sizes in the arena stay 0 during
+/// the walk, so re-aggregating a fresh clone each time is always correct.
+fn snapshot(nodes: &[Node], root_idx: usize, root_path: &Path) -> Tree {
+    let mut nodes = nodes.to_vec();
+    aggregate(&mut nodes, root_idx);
+    sort_children(&mut nodes);
+    Tree {
+        nodes,
+        root: root_idx,
+        root_path: root_path.to_path_buf(),
     }
 }
 
@@ -262,5 +318,70 @@ fn sort_children(nodes: &mut [Node]) {
             kids.sort_by(|&a, &b| nodes[b].size.cmp(&nodes[a].size));
             nodes[i].children = kids;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Build a small directory tree in a unique temp dir. Returns its path.
+    fn make_tree(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("diskscour_{}_{}", std::process::id(), tag));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        fs::create_dir_all(base.join("c")).unwrap();
+        fs::write(base.join("a/f1"), vec![0u8; 4096]).unwrap();
+        fs::write(base.join("a/b/f2"), vec![0u8; 8192]).unwrap();
+        fs::write(base.join("c/f3"), vec![0u8; 2048]).unwrap();
+        base
+    }
+
+    #[test]
+    fn streaming_snapshots_are_monotonic_and_match_final() {
+        let base = make_tree("stream");
+        let prog = Arc::new(ScanProgress::default());
+
+        // Force a snapshot on every entry so streaming is exercised deterministically.
+        let mut snaps = 0usize;
+        let mut last_total = 0u64;
+        let mut last_files = 0u64;
+        let final_tree = scan_impl(
+            base.clone(),
+            prog,
+            |snap| {
+                snaps += 1;
+                let total = snap.nodes[snap.root].size;
+                let files = snap.nodes[snap.root].file_count;
+                // Growing arena → root totals never shrink between snapshots.
+                assert!(total >= last_total, "root size regressed across snapshots");
+                assert!(files >= last_files, "file count regressed across snapshots");
+                last_total = total;
+                last_files = files;
+            },
+            Some(Duration::ZERO),
+        );
+
+        assert!(snaps >= 1, "expected at least one snapshot to fire");
+        let final_total = final_tree.nodes[final_tree.root].size;
+        let final_files = final_tree.nodes[final_tree.root].file_count;
+        assert_eq!(final_files, 3, "three files expected under the tree");
+        assert!(final_total > 0);
+        // The last snapshot reflects the fully-walked arena, so it matches the final.
+        assert_eq!(last_files, final_files);
+        assert_eq!(last_total, final_total);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn streaming_final_equals_plain_scan() {
+        let base = make_tree("equal");
+        let a = scan(base.clone(), Arc::new(ScanProgress::default()));
+        let b = scan_streaming(base.clone(), Arc::new(ScanProgress::default()), |_| {});
+        assert_eq!(a.nodes[a.root].size, b.nodes[b.root].size);
+        assert_eq!(a.nodes[a.root].file_count, b.nodes[b.root].file_count);
+        let _ = fs::remove_dir_all(&base);
     }
 }
