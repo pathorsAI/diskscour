@@ -117,6 +117,13 @@ struct Pending {
     items: Vec<(usize, PathBuf, u64)>, // (node idx, path, size)
 }
 
+/// Streamed output from the scan thread: periodic partial snapshots while the
+/// walk is in progress, then a final complete tree.
+enum ScanMsg {
+    Partial(Tree),
+    Done(Tree),
+}
+
 /// Deferred UI events, applied after the frame is rendered to keep borrows simple.
 enum Action {
     Toggle(usize),
@@ -139,7 +146,7 @@ struct DiskScourApp {
     root_input: String,
     tree: Option<Tree>,
     scanning: bool,
-    rx: Option<Receiver<Tree>>,
+    rx: Option<Receiver<ScanMsg>>,
     progress: Arc<ScanProgress>,
     scan_started: Option<Instant>,
     scan_secs: f32,
@@ -156,6 +163,9 @@ struct DiskScourApp {
     pending: Option<Pending>,
     trashing: bool,
     trash_rx: Option<Receiver<Vec<(usize, bool, u64)>>>, // (node idx, ok, size)
+    /// Nodes trashed during this scan, by (stable) index. Re-applied to each new
+    /// snapshot so trashed items don't reappear when the scan refreshes the tree.
+    trashed: HashSet<usize>,
     status: String,
 }
 
@@ -191,36 +201,86 @@ impl DiskScourApp {
     // ---- scanning lifecycle -------------------------------------------------
 
     fn poll_scan(&mut self) {
-        if let Some(rx) = self.rx.take() {
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+        // Drain everything queued this frame and keep only the newest tree; older
+        // snapshots are superseded so there's no point installing each one.
+        let mut latest: Option<Tree> = None;
+        let mut done = false;
+        let mut alive = true;
+        loop {
             match rx.try_recv() {
-                Ok(tree) => {
-                    self.scan_secs = self
-                        .scan_started
-                        .map(|s| s.elapsed().as_secs_f32())
-                        .unwrap_or(0.0);
-                    self.cache_hits = caches::detect(&tree);
-                    self.selected = Some(tree.root);
-                    self.map_root = Some(tree.root);
-                    self.expanded.insert(tree.root);
-                    let total = tree.nodes[tree.root].size;
-                    let files = tree.nodes[tree.root].file_count;
-                    let recl: u64 = self.cache_hits.iter().map(|h| h.size).sum();
-                    self.tree = Some(tree);
-                    self.scanning = false;
-                    self.status = format!(
-                        "{} across {} files in {:.1}s · {} reclaimable in dev caches",
-                        util::human(total),
-                        files,
-                        self.scan_secs,
-                        util::human(recl)
-                    );
+                Ok(ScanMsg::Partial(t)) => latest = Some(t),
+                Ok(ScanMsg::Done(t)) => {
+                    latest = Some(t);
+                    done = true;
                 }
-                Err(TryRecvError::Empty) => self.rx = Some(rx),
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.scanning = false;
-                    self.status = "Scan failed.".into();
+                    alive = false;
+                    break;
                 }
             }
+        }
+        if let Some(tree) = latest {
+            self.install_scan_tree(tree, done);
+        }
+        if done {
+            // scanning flag already cleared by install_scan_tree.
+        } else if !alive {
+            // Thread ended without a Done message — treat as failure unless we
+            // already have something to show.
+            self.scanning = false;
+            if self.tree.is_none() {
+                self.status = "Scan failed.".into();
+            }
+        } else {
+            self.rx = Some(rx); // still scanning; keep listening next frame
+        }
+    }
+
+    /// Install a scanned tree (partial or final). Preserves the user's browsing
+    /// state across partial refreshes and re-applies any trashing done so far.
+    fn install_scan_tree(&mut self, mut tree: Tree, done: bool) {
+        let first = self.selected.is_none();
+        // Re-hide anything trashed during this scan (indices are stable).
+        for &idx in &self.trashed {
+            if idx < tree.nodes.len() {
+                tree.remove(idx);
+            }
+        }
+        self.cache_hits = caches::detect(&tree);
+        if first {
+            self.selected = Some(tree.root);
+            self.map_root = Some(tree.root);
+            self.expanded.insert(tree.root);
+        }
+        let total = tree.nodes[tree.root].size;
+        let files = tree.nodes[tree.root].file_count;
+        let recl: u64 = self.cache_hits.iter().map(|h| h.size).sum();
+        self.tree = Some(tree);
+        self.fix_refs();
+        if done {
+            self.scanning = false;
+            self.scan_secs = self
+                .scan_started
+                .map(|s| s.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            self.status = format!(
+                "{} across {} files in {:.1}s · {} reclaimable in dev caches",
+                util::human(total),
+                files,
+                self.scan_secs,
+                util::human(recl)
+            );
+        } else {
+            self.status = format!(
+                "Scanning… {} across {} files · {} reclaimable so far",
+                util::human(total),
+                files,
+                util::human(recl)
+            );
         }
     }
 
@@ -232,6 +292,7 @@ impl DiskScourApp {
         self.tree = None;
         self.cache_hits.clear();
         self.cache_selected.clear();
+        self.trashed.clear();
         self.selected = None;
         self.map_root = None;
         self.expanded.clear();
@@ -241,8 +302,11 @@ impl DiskScourApp {
         let prog = self.progress.clone();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let t = scan::scan(root, prog);
-            let _ = tx.send(t);
+            let snap_tx = tx.clone();
+            let tree = scan::scan_streaming(root, prog, move |snap| {
+                let _ = snap_tx.send(ScanMsg::Partial(snap));
+            });
+            let _ = tx.send(ScanMsg::Done(tree));
         });
         self.rx = Some(rx);
         self.scanning = true;
@@ -280,18 +344,15 @@ impl DiskScourApp {
                 }
             }
             Action::CacheSelectAll => {
-                self.cache_selected = (0..self.cache_hits.len()).collect();
+                self.cache_selected = self.cache_hits.iter().map(|h| h.node_idx).collect();
             }
             Action::CacheSelectNone => self.cache_selected.clear(),
             Action::RequestTrashCaches => {
                 let mut items: Vec<(usize, PathBuf, u64)> = self
-                    .cache_selected
+                    .cache_hits
                     .iter()
-                    .filter_map(|&i| {
-                        self.cache_hits
-                            .get(i)
-                            .map(|h| (h.node_idx, h.path.clone(), h.size))
-                    })
+                    .filter(|h| self.cache_selected.contains(&h.node_idx))
+                    .map(|h| (h.node_idx, h.path.clone(), h.size))
                     .collect();
                 items.sort_by(|a, b| b.2.cmp(&a.2));
                 if !items.is_empty() {
@@ -338,6 +399,7 @@ impl DiskScourApp {
                         if success {
                             ok += 1;
                             freed += size;
+                            self.trashed.insert(idx);
                             if let Some(t) = &mut self.tree {
                                 t.remove(idx);
                             }
@@ -765,9 +827,9 @@ impl DiskScourApp {
     fn ui_caches(&mut self, ui: &mut egui::Ui, tree: &Tree, actions: &RefCell<Vec<Action>>) {
         let total_all: u64 = self.cache_hits.iter().map(|h| h.size).sum();
         let total_sel: u64 = self
-            .cache_selected
+            .cache_hits
             .iter()
-            .filter_map(|&i| self.cache_hits.get(i))
+            .filter(|h| self.cache_selected.contains(&h.node_idx))
             .map(|h| h.size)
             .sum();
 
@@ -824,17 +886,18 @@ impl DiskScourApp {
                         .show(ui, |ui| {
                             for &i in idxs {
                                 let h = &self.cache_hits[i];
+                                let node_idx = h.node_idx;
                                 let rel = h
                                     .path
                                     .strip_prefix(&root_path)
                                     .unwrap_or(&h.path)
                                     .display()
                                     .to_string();
-                                let checked = self.cache_selected.contains(&i);
+                                let checked = self.cache_selected.contains(&node_idx);
                                 ui.horizontal(|ui| {
                                     let mut c = checked;
                                     if ui.checkbox(&mut c, "").changed() {
-                                        actions.borrow_mut().push(Action::ToggleCache(i));
+                                        actions.borrow_mut().push(Action::ToggleCache(node_idx));
                                     }
                                     let (chip, _) = ui.allocate_exact_size(
                                         egui::vec2(10.0, 10.0),
