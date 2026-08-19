@@ -3,13 +3,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod caches;
+mod cleanup;
+mod cli;
+mod engine;
+mod fsevents;
+mod index;
+mod mcp;
 mod scan;
 mod treemap;
 mod util;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
@@ -24,16 +30,36 @@ use caches::CacheHit;
 use scan::{ScanProgress, Tree};
 
 fn main() -> eframe::Result {
-    // Headless mode: `disktree scan <path>` prints a summary without a window.
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("scan") {
-        let path = args
-            .get(2)
-            .map(PathBuf::from)
-            .or_else(home_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-        run_cli(path);
-        return Ok(());
+    // Headless modes. `diskscour` with no arguments opens the window.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("mcp") => {
+            if let Err(e) = mcp::serve() {
+                eprintln!("diskscour: mcp server: {e}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some("-h" | "--help" | "help") => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        Some("-V" | "--version") => {
+            println!("diskscour {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(cmd @ ("scan" | "caches" | "status" | "trash")) => {
+            std::process::exit(cli::run(cmd, &args[1..]));
+        }
+        Some(other) if other.starts_with('-') => {
+            eprintln!("diskscour: unknown flag: {other}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+        Some(other) => {
+            eprintln!("diskscour: unknown command: {other}\n\n{}", cli::USAGE);
+            std::process::exit(2);
+        }
+        None => {}
     }
 
     let native_options = eframe::NativeOptions {
@@ -50,58 +76,30 @@ fn main() -> eframe::Result {
             let mut app = DiskScourApp::default();
             if let Some(home) = home_dir() {
                 app.root_input = home.display().to_string();
+                // Show the last scan of this folder immediately, if we have one,
+                // so the window is useful before any walking starts.
+                app.load_cached(&home);
             }
             Ok(Box::new(app) as Box<dyn eframe::App>)
         }),
     )
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+/// Compact relative age for the status line.
+fn human_age(secs: u64) -> String {
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
 }
 
-/// Headless scan: print totals, the largest children, and detected dev caches.
-fn run_cli(root: PathBuf) {
-    let progress = Arc::new(ScanProgress::default());
-    let started = Instant::now();
-    let tree = scan::scan(root.clone(), progress);
-    let secs = started.elapsed().as_secs_f32();
-    let r = &tree.nodes[tree.root];
-    println!(
-        "\n{}\n  {} across {} files in {:.2}s\n",
-        tree.root_path.display(),
-        util::human(r.size),
-        r.file_count,
-        secs
-    );
-
-    println!("Largest entries:");
-    for &c in tree.nodes[tree.root].children.iter().take(20) {
-        let n = &tree.nodes[c];
-        println!(
-            "  {:>10}  {}{}",
-            util::human(n.size),
-            n.name,
-            if n.is_dir { "/" } else { "" }
-        );
-    }
-
-    let hits = caches::detect(&tree);
-    let reclaimable: u64 = hits.iter().map(|h| h.size).sum();
-    println!(
-        "\nDev caches: {} reclaimable across {} dirs",
-        util::human(reclaimable),
-        hits.len()
-    );
-    for h in hits.iter().take(25) {
-        let rel = h.path.strip_prefix(&root).unwrap_or(&h.path);
-        println!(
-            "  {:>10}  [{}] {}",
-            util::human(h.size),
-            h.category.label(),
-            rel.display()
-        );
-    }
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Default)]
@@ -121,7 +119,10 @@ struct Pending {
 /// walk is in progress, then a final complete tree.
 enum ScanMsg {
     Partial(Tree),
-    Done(Tree),
+    /// Boxed: the finished refresh carries the tree plus the index and the
+    /// explanation of which strategy was used, which is much larger than a
+    /// partial snapshot.
+    Done(Box<engine::Refreshed>),
 }
 
 /// Deferred UI events, applied after the frame is rendered to keep borrows simple.
@@ -167,6 +168,10 @@ struct DiskScourApp {
     /// snapshot so trashed items don't reappear when the scan refreshes the tree.
     trashed: HashSet<usize>,
     status: String,
+    /// How the currently displayed tree was produced, shown in the status line so
+    /// the numbers are never presented without their provenance.
+    scan_mode: Option<index::Mode>,
+    scan_note: String,
 }
 
 impl eframe::App for DiskScourApp {
@@ -212,8 +217,10 @@ impl DiskScourApp {
         loop {
             match rx.try_recv() {
                 Ok(ScanMsg::Partial(t)) => latest = Some(t),
-                Ok(ScanMsg::Done(t)) => {
-                    latest = Some(t);
+                Ok(ScanMsg::Done(r)) => {
+                    self.scan_mode = Some(r.mode);
+                    self.scan_note = r.reason.clone();
+                    latest = Some(r.tree);
                     done = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -268,11 +275,15 @@ impl DiskScourApp {
                 .map(|s| s.elapsed().as_secs_f32())
                 .unwrap_or(0.0);
             self.status = format!(
-                "{} across {} files in {:.1}s · {} reclaimable in dev caches",
+                "{} across {} files in {:.1}s · {} reclaimable in dev caches{}",
                 util::human(total),
                 files,
                 self.scan_secs,
-                util::human(recl)
+                util::human(recl),
+                match self.scan_mode {
+                    Some(index::Mode::Full) | None => String::new(),
+                    Some(m) => format!(" · {} refresh ({})", m.as_str(), self.scan_note),
+                }
             );
         } else {
             self.status = format!(
@@ -284,12 +295,30 @@ impl DiskScourApp {
         }
     }
 
+    /// Show the previous scan of `root` straight away, if one is cached.
+    /// Purely a head start — a refresh still runs and replaces this.
+    fn load_cached(&mut self, root: &Path) {
+        let Some(idx) = engine::cached(root) else {
+            return;
+        };
+        let tree = index::to_tree(&idx);
+        let total = tree.nodes[tree.root].size;
+        self.disk = util::disk_usage(root);
+        self.scan_mode = Some(idx.mode);
+        self.scan_note = format!("cached, {} old", human_age(idx.age_secs()));
+        self.install_scan_tree(tree, false);
+        self.status = format!(
+            "{} from the last scan ({} ago) — refreshing…",
+            util::human(total),
+            human_age(idx.age_secs())
+        );
+    }
+
     fn start_scan(&mut self, root: PathBuf) {
         if self.scanning {
             return;
         }
         self.progress = Arc::new(ScanProgress::default());
-        self.tree = None;
         self.cache_hits.clear();
         self.cache_selected.clear();
         self.trashed.clear();
@@ -303,10 +332,10 @@ impl DiskScourApp {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let snap_tx = tx.clone();
-            let tree = scan::scan_streaming(root, prog, move |snap| {
+            let result = engine::refresh(root, engine::Freshness::Auto, prog, move |snap| {
                 let _ = snap_tx.send(ScanMsg::Partial(snap));
             });
-            let _ = tx.send(ScanMsg::Done(tree));
+            let _ = tx.send(ScanMsg::Done(Box::new(result)));
         });
         self.rx = Some(rx);
         self.scanning = true;
@@ -374,12 +403,32 @@ impl DiskScourApp {
         let Some(p) = self.pending.take() else {
             return;
         };
+        // Deleting goes through the same guarded path the CLI and MCP server use,
+        // so the structural checks (never the scan root, never outside it, never
+        // through a symlink that escapes it) hold here too. `allow_any` is on
+        // because a GUI selection is an explicit, confirmed choice of a specific
+        // path rather than a rule match.
+        let Some(root) = self.tree.as_ref().map(|t| t.root_path.clone()) else {
+            return;
+        };
         let (tx, rx) = channel();
         std::thread::spawn(move || {
+            let items: Vec<cleanup::Item> = p
+                .items
+                .iter()
+                .map(|(_, path, size)| cleanup::Item {
+                    path: path.clone(),
+                    bytes: *size,
+                    category: None,
+                    note: None,
+                })
+                .collect();
+            let outcomes = cleanup::execute(&root, &items, true);
             let out: Vec<(usize, bool, u64)> = p
                 .items
-                .into_iter()
-                .map(|(idx, path, size)| (idx, trash::delete(&path).is_ok(), size))
+                .iter()
+                .zip(outcomes)
+                .map(|((idx, _, size), o)| (*idx, o.trashed, *size))
                 .collect();
             let _ = tx.send(out);
         });
@@ -524,7 +573,9 @@ impl DiskScourApp {
             let node = &tree.nodes[sel];
             let path = tree.path(sel);
             let size = node.size;
-            let is_root = sel == tree.root;
+            // A synthetic row stands in for a directory's collapsed small files;
+            // it has no path of its own, so none of these actions apply to it.
+            let is_root = sel == tree.root || node.synthetic;
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(RichText::new(util::human(size)).strong());
@@ -537,11 +588,13 @@ impl DiskScourApp {
                             size,
                         )]));
                     }
-                    if ui.button("Open").clicked() {
-                        actions.borrow_mut().push(Action::OpenPath(path.clone()));
-                    }
-                    if ui.button("Reveal").clicked() {
-                        actions.borrow_mut().push(Action::Reveal(path.clone()));
+                    if !node.synthetic {
+                        if ui.button("Open").clicked() {
+                            actions.borrow_mut().push(Action::OpenPath(path.clone()));
+                        }
+                        if ui.button("Reveal").clicked() {
+                            actions.borrow_mut().push(Action::Reveal(path.clone()));
+                        }
                     }
                 });
             });
@@ -596,6 +649,7 @@ impl DiskScourApp {
             return;
         }
         let is_dir = node.is_dir;
+        let synthetic = node.synthetic;
         let has_children = !node.children.is_empty();
         let name = node.name.clone();
         let path = tree.path(idx);
@@ -637,6 +691,10 @@ impl DiskScourApp {
                     actions.borrow_mut().push(Action::Toggle(idx));
                 }
                 r.context_menu(|ui| {
+                    if synthetic {
+                        ui.label("Summary of this folder's small files — no path to act on.");
+                        return;
+                    }
                     if ui.button("Reveal in Finder").clicked() {
                         actions.borrow_mut().push(Action::Reveal(path.clone()));
                         ui.close();

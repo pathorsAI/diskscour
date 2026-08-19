@@ -1,6 +1,6 @@
 [package]
 name = "diskscour"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Fast macOS disk-usage analyzer with a tree browser, treemap, and one-click cleanup of regenerable dev/build caches."
 authors = ["Pathors"]
@@ -16,6 +16,16 @@ eframe = { version = "0.33.3", default-features = false, features = ["glow", "de
 jwalk = "0.8.1"
 # core trash::delete only — drops the chrono dependency pulled by defaults
 trash = { version = "5.2.6", default-features = false }
+# MCP speaks JSON-RPC over stdio. serde_json alone (no derive, no async runtime)
+# is enough for the three methods the protocol needs.
+serde_json = "1.0"
+
+# FSEvents history replay, used to find what changed since the last scan. The
+# CoreServices entry points are declared in src/fsevents.rs rather than taken
+# from `fsevent-sys`, which now drags in core-foundation and dispatch2 for the
+# eight symbols we need; this leaf crate supplies the CF types and nothing else.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8.7"
 
 [profile.release]
 opt-level = "s"   # optimize for size; scan is I/O-bound so this costs ~nothing

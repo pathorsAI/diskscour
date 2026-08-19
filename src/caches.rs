@@ -7,7 +7,7 @@
 //! double-count.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use eframe::egui::Color32;
 
@@ -446,6 +446,115 @@ pub struct CacheHit {
     pub size: u64,
     pub category: Category,
     pub note: &'static str,
+}
+
+/// A cache detected by scanning the persistent index rather than a live tree.
+pub struct IndexHit {
+    pub path: PathBuf,
+    pub size: u64,
+    pub files: u64,
+    pub category: Category,
+    pub note: &'static str,
+}
+
+/// Find caches from a cached index, confirming each candidate against the
+/// filesystem.
+///
+/// The index collapses small files, so the marker files rules depend on
+/// (`Cargo.toml`, `package.json`, …) are not in it. Rather than bloat the index
+/// with them, candidates are matched by directory name — which the index does
+/// have — and then confirmed with [`classify_path`]. That also drops anything
+/// that has been deleted since the scan, so the list is never stale.
+pub fn detect_in_index(idx: &crate::index::Index) -> Vec<IndexHit> {
+    let mut matched: Vec<(u32, Category, &'static str)> = Vec::new();
+    let mut matchset: HashSet<u32> = HashSet::new();
+
+    for (i, d) in idx.dirs.iter().enumerate() {
+        let i = i as u32;
+        // Never flag the scan root itself — that would offer to delete the
+        // folder being analyzed.
+        if i == idx.root_ix || d.subtree_bytes == 0 {
+            continue;
+        }
+        if !RULES.iter().any(|r| name_matches(r, &d.name)) {
+            continue;
+        }
+        if let Some((category, note)) = classify_path(&idx.path_of(i)) {
+            matched.push((i, category, note));
+            matchset.insert(i);
+        }
+    }
+
+    let mut hits = Vec::new();
+    for (i, category, note) in matched {
+        // Skip anything nested inside another hit, so totals don't double-count.
+        let mut anc = idx.dirs[i as usize].parent;
+        let mut nested = false;
+        while let Some(p) = anc {
+            if matchset.contains(&p) {
+                nested = true;
+                break;
+            }
+            anc = idx.dirs[p as usize].parent;
+        }
+        if nested {
+            continue;
+        }
+        hits.push(IndexHit {
+            path: idx.path_of(i),
+            size: idx.dirs[i as usize].subtree_bytes,
+            files: idx.dirs[i as usize].subtree_files,
+            category,
+            note,
+        });
+    }
+    hits.sort_by(|a, b| b.size.cmp(&a.size));
+    hits
+}
+
+/// Re-check a path against the cache rules using the filesystem directly, with
+/// no reliance on a previously scanned tree.
+///
+/// This is the guard used immediately before deleting anything: an index can be
+/// minutes or days old, and in that time a `target/` may have stopped being a
+/// Rust build directory. Matching against what is on disk *right now* means a
+/// stale index can never cause the wrong thing to be trashed.
+pub fn classify_path(path: &Path) -> Option<(Category, &'static str)> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    if !md.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let parent = path.parent();
+    for rule in RULES {
+        if !name_matches(rule, name) {
+            continue;
+        }
+        let sib_ok = if rule.sibling_any.is_empty() && rule.sibling_ext.is_empty() {
+            true
+        } else if let Some(p) = parent {
+            rule.sibling_any.iter().any(|s| p.join(s).exists())
+                || (!rule.sibling_ext.is_empty()
+                    && std::fs::read_dir(p).is_ok_and(|rd| {
+                        rd.flatten().any(|e| {
+                            let n = e.file_name();
+                            let n = n.to_string_lossy();
+                            rule.sibling_ext.iter().any(|ext| n.ends_with(ext))
+                        })
+                    }))
+        } else {
+            false
+        };
+        if !sib_ok {
+            continue;
+        }
+        let child_ok =
+            rule.child_any.is_empty() || rule.child_any.iter().any(|c| path.join(c).exists());
+        if child_ok {
+            return Some((rule.category, rule.note));
+        }
+    }
+    None
 }
 
 fn name_matches(rule: &Rule, name: &str) -> bool {

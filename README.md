@@ -52,13 +52,72 @@ cargo install cargo-bundle --locked
 cargo bundle --release   # → target/release/bundle/osx/DiskScour.app
 ```
 
-### Terminal one-liner
+### From the terminal
 
 No window, just the numbers:
 
 ```sh
 diskscour scan ~/Github
 ```
+
+Everything is available as JSON for scripting — `--json` works on `scan`, `caches`,
+`status` and `trash`:
+
+```sh
+diskscour caches ~/Github --json --min 1000000000   # every cache over 1 GB
+diskscour status                                    # what's already indexed
+diskscour trash ~/Github/some/target                # previews; add --yes to do it
+```
+
+`diskscour --help` lists the lot.
+
+## Scan once, query often
+
+The first scan of a folder is a full walk. After that DiskScour keeps a small
+index in `~/Library/Caches/com.pathors.diskscour/`, and asks the macOS FSEvents
+log what changed since — so a repeat scan only walks the directories that
+actually moved.
+
+```
+~/Github, 140.9 GB across 5.1M files
+
+  first scan   67.51s   full
+  rescan        0.66s   events · 4 directories changed
+```
+
+Two things keep that honest. Any doubt about the event history — dropped events,
+a purged log, a network volume, a root reached through a symlink — falls back to
+a slower strategy rather than pruning on a guess. And every result says which
+strategy produced it, so the numbers never arrive without their provenance.
+
+The one thing incremental refresh can miss is a file that grows *in place*
+without its directory changing. `--full` corrects that on demand, and an index
+older than a week does a full scan on its own.
+
+## Use it from Claude Code
+
+DiskScour speaks MCP, so a coding agent can read the scan results and clean up
+without shelling out and parsing text:
+
+```sh
+claude mcp add diskscour -- /usr/local/bin/diskscour mcp
+```
+
+That adds six tools: `ds_status`, `ds_scan`, `ds_caches`, `ds_top`, `ds_tree`
+and `ds_trash`. Reads are served from the index rather than by scanning, so
+asking is cheap.
+
+Deleting is the part worth being careful about, so the guards live in the code
+rather than in a tool description:
+
+- `ds_trash` **previews by default** and deletes nothing without `confirm: true`.
+- Only recognised regenerable caches are accepted. Anything else needs
+  `allow_any`, which is documented as something the user has to ask for by name.
+- Targets must sit inside an indexed root. The scan root itself, `$HOME`, paths
+  containing `..`, and symlinks resolving out of the root are refused outright.
+- Every target is **re-checked against the filesystem at the moment of deletion**,
+  so a stale index can't cause the wrong thing to go.
+- Deletion always means the macOS Trash. There is no hard-delete path.
 
 ## License
 

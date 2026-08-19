@@ -1,0 +1,426 @@
+//! The headless commands. `diskscour` with no arguments opens the window;
+//! everything here is for a terminal or another program.
+//!
+//! Every listing command takes `--json`, because the most common non-human
+//! caller is a coding agent that would otherwise have to parse columns.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use serde_json::{Value, json};
+
+use crate::caches;
+use crate::cleanup;
+use crate::engine::{self, Freshness};
+use crate::index::Index;
+use crate::scan::ScanProgress;
+use crate::util;
+
+pub const USAGE: &str = "\
+DiskScour — disk-usage analyzer with dev-cache cleanup
+
+  diskscour                        open the window
+  diskscour scan <path> [--json] [--full]
+                                   scan a folder and update its cached index
+  diskscour caches <path> [--json] [--min <bytes>]
+                                   list regenerable dev caches from the index
+  diskscour status [--json]        show every indexed folder
+  diskscour trash <path>... [--yes] [--allow-any]
+                                   move caches to the Trash (previews unless --yes)
+  diskscour mcp                    run as an MCP server on stdio
+
+Scans reuse the previous result where they can, so a repeat scan of the same
+folder is fast. --full re-stats everything.
+";
+
+/// Parsed flags, plus whatever was left over as positional arguments.
+struct Args {
+    positional: Vec<String>,
+    json: bool,
+    full: bool,
+    yes: bool,
+    allow_any: bool,
+    min: u64,
+}
+
+fn parse(rest: &[String]) -> Result<Args, String> {
+    let mut a = Args {
+        positional: Vec::new(),
+        json: false,
+        full: false,
+        yes: false,
+        allow_any: false,
+        min: 0,
+    };
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" => a.json = true,
+            "--full" => a.full = true,
+            "--yes" | "-y" => a.yes = true,
+            "--allow-any" => a.allow_any = true,
+            "--min" => {
+                let v = it.next().ok_or("--min needs a value")?;
+                a.min = v.parse().map_err(|_| format!("--min: not a number: {v}"))?;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
+            other => a.positional.push(other.to_string()),
+        }
+    }
+    Ok(a)
+}
+
+fn path_arg(a: &Args, what: &str) -> Result<PathBuf, String> {
+    let raw = a
+        .positional
+        .first()
+        .ok_or_else(|| format!("{what} needs a path"))?;
+    Ok(expand(raw))
+}
+
+fn expand(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+    }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    let p = PathBuf::from(raw);
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().unwrap_or_default().join(p)
+    }
+}
+
+/// Run a subcommand. Returns the process exit code.
+pub fn run(command: &str, rest: &[String]) -> i32 {
+    let args = match parse(rest) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("diskscour: {e}\n\n{USAGE}");
+            return 2;
+        }
+    };
+    let result = match command {
+        "scan" => cmd_scan(&args),
+        "caches" => cmd_caches(&args),
+        "status" => cmd_status(&args),
+        "trash" => cmd_trash(&args),
+        other => Err(format!("unknown command: {other}")),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("diskscour: {e}");
+            1
+        }
+    }
+}
+
+fn emit(json: bool, value: &Value, human: impl FnOnce()) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(value).unwrap_or_default()
+        );
+    } else {
+        human();
+    }
+}
+
+// ---- scan -------------------------------------------------------------------
+
+fn cmd_scan(a: &Args) -> Result<(), String> {
+    let root = path_arg(a, "scan")?;
+    if !root.is_dir() {
+        return Err(format!("{} is not a directory", root.display()));
+    }
+    let freshness = if a.full {
+        Freshness::Full
+    } else {
+        Freshness::Auto
+    };
+    let r = engine::refresh(
+        root.clone(),
+        freshness,
+        Arc::new(ScanProgress::default()),
+        |_| {},
+    );
+    let hits = caches::detect_in_index(&r.index);
+    let reclaimable: u64 = hits.iter().map(|h| h.size).sum();
+    let total = r.index.total_bytes();
+
+    let value = json!({
+        "root": root.to_string_lossy(),
+        "total_bytes": total,
+        "total_human": util::human(total),
+        "files": r.index.total_files(),
+        "reclaimable_bytes": reclaimable,
+        "reclaimable_human": util::human(reclaimable),
+        "cache_dirs": hits.len(),
+        "seconds": (r.secs * 100.0).round() / 100.0,
+        "mode": r.mode.as_str(),
+        "why": r.reason,
+        "changed_dirs": r.changed_dirs,
+        "index_saved": r.saved,
+        "largest": hits.iter().take(25).map(|h| json!({
+            "path": h.path.to_string_lossy(),
+            "bytes": h.size,
+            "human": util::human(h.size),
+            "category": h.category.label(),
+        })).collect::<Vec<_>>(),
+    });
+
+    emit(a.json, &value, || {
+        println!(
+            "\n{}\n  {} across {} files in {:.2}s  [{}: {}]\n",
+            root.display(),
+            util::human(total),
+            r.index.total_files(),
+            r.secs,
+            r.mode.as_str(),
+            r.reason
+        );
+        println!(
+            "Dev caches: {} reclaimable across {} dirs",
+            util::human(reclaimable),
+            hits.len()
+        );
+        for h in hits.iter().take(25) {
+            let rel = h.path.strip_prefix(&root).unwrap_or(&h.path);
+            println!(
+                "  {:>10}  [{}] {}",
+                util::human(h.size),
+                h.category.label(),
+                rel.display()
+            );
+        }
+    });
+    Ok(())
+}
+
+// ---- caches -----------------------------------------------------------------
+
+fn require_index(path: &std::path::Path) -> Result<Index, String> {
+    engine::index_covering(path).ok_or_else(|| {
+        format!(
+            "no index covers {} — run `diskscour scan {}` first",
+            path.display(),
+            path.display()
+        )
+    })
+}
+
+fn cmd_caches(a: &Args) -> Result<(), String> {
+    let path = path_arg(a, "caches")?;
+    let idx = require_index(&path)?;
+    let all = caches::detect_in_index(&idx);
+    let hits: Vec<&caches::IndexHit> = all
+        .iter()
+        .filter(|h| h.path.starts_with(&path) || path.starts_with(&h.path))
+        .filter(|h| h.size >= a.min)
+        .collect();
+    let total: u64 = hits.iter().map(|h| h.size).sum();
+
+    let value = json!({
+        "root": idx.root.to_string_lossy(),
+        "scanned_at": idx.scanned_at,
+        "age_seconds": idx.age_secs(),
+        "mode": idx.mode.as_str(),
+        "reclaimable_bytes": total,
+        "reclaimable_human": util::human(total),
+        "caches": hits.iter().map(|h| json!({
+            "path": h.path.to_string_lossy(),
+            "bytes": h.size,
+            "human": util::human(h.size),
+            "files": h.files,
+            "category": h.category.label(),
+            "note": h.note,
+        })).collect::<Vec<_>>(),
+    });
+
+    emit(a.json, &value, || {
+        println!(
+            "{} reclaimable across {} dirs under {}",
+            util::human(total),
+            hits.len(),
+            path.display()
+        );
+        for h in &hits {
+            println!(
+                "  {:>10}  [{}] {}",
+                util::human(h.size),
+                h.category.label(),
+                h.path.display()
+            );
+        }
+    });
+    Ok(())
+}
+
+// ---- status -----------------------------------------------------------------
+
+fn cmd_status(a: &Args) -> Result<(), String> {
+    let roots = engine::cached_roots();
+    let rows: Vec<Value> = roots
+        .iter()
+        .map(|idx| {
+            let hits = caches::detect_in_index(idx);
+            let recl: u64 = hits.iter().map(|h| h.size).sum();
+            json!({
+                "root": idx.root.to_string_lossy(),
+                "total_bytes": idx.total_bytes(),
+                "total_human": util::human(idx.total_bytes()),
+                "files": idx.total_files(),
+                "reclaimable_bytes": recl,
+                "reclaimable_human": util::human(recl),
+                "scanned_at": idx.scanned_at,
+                "age_seconds": idx.age_secs(),
+                "mode": idx.mode.as_str(),
+            })
+        })
+        .collect();
+
+    emit(a.json, &json!({"indexed_roots": rows}), || {
+        if roots.is_empty() {
+            println!("Nothing indexed yet. Try `diskscour scan ~`.");
+            return;
+        }
+        for (idx, row) in roots.iter().zip(&rows) {
+            println!(
+                "{:>10}  {:>10} reclaimable  {:>6}  {}",
+                util::human(idx.total_bytes()),
+                row["reclaimable_human"].as_str().unwrap_or("-"),
+                idx.mode.as_str(),
+                idx.root.display()
+            );
+        }
+    });
+    Ok(())
+}
+
+// ---- trash ------------------------------------------------------------------
+
+fn cmd_trash(a: &Args) -> Result<(), String> {
+    if a.positional.is_empty() {
+        return Err("trash needs at least one path".into());
+    }
+    let paths: Vec<PathBuf> = a.positional.iter().map(|p| expand(p)).collect();
+    let idx = require_index(&paths[0])?;
+    let root = idx.root.clone();
+
+    let plan = cleanup::plan(&root, &paths, a.allow_any);
+    for r in &plan.rejected {
+        eprintln!("  skipped  {}  ({})", r.path.display(), r.reason);
+    }
+    if plan.items.is_empty() {
+        return Err("nothing to trash".into());
+    }
+
+    if !a.yes {
+        let value = json!({
+            "confirmed": false,
+            "would_free_bytes": plan.total_bytes(),
+            "would_free_human": util::human(plan.total_bytes()),
+            "would_trash": plan.items.iter().map(|i| json!({
+                "path": i.path.to_string_lossy(),
+                "bytes": i.bytes,
+                "human": util::human(i.bytes),
+                "category": i.category.map(|c| c.label()),
+                "note": i.note,
+            })).collect::<Vec<_>>(),
+        });
+        emit(a.json, &value, || {
+            println!(
+                "Would move {} to the Trash ({} items):",
+                util::human(plan.total_bytes()),
+                plan.items.len()
+            );
+            for i in &plan.items {
+                println!("  {:>10}  {}", util::human(i.bytes), i.path.display());
+            }
+            println!("\nRe-run with --yes to do it.");
+        });
+        return Ok(());
+    }
+
+    let outcomes = cleanup::execute(&root, &plan.items, a.allow_any);
+    let freed: u64 = outcomes.iter().filter(|o| o.trashed).map(|o| o.bytes).sum();
+    let failed = outcomes.iter().filter(|o| !o.trashed).count();
+
+    let value = json!({
+        "confirmed": true,
+        "freed_bytes": freed,
+        "freed_human": util::human(freed),
+        "trashed_count": outcomes.iter().filter(|o| o.trashed).count(),
+        "failed_count": failed,
+        "results": outcomes.iter().map(|o| json!({
+            "path": o.path.to_string_lossy(),
+            "trashed": o.trashed,
+            "bytes": o.bytes,
+            "error": o.error,
+        })).collect::<Vec<_>>(),
+    });
+
+    emit(a.json, &value, || {
+        for o in &outcomes {
+            match &o.error {
+                None => println!(
+                    "  trashed  {:>10}  {}",
+                    util::human(o.bytes),
+                    o.path.display()
+                ),
+                Some(e) => println!("  FAILED   {}  ({e})", o.path.display()),
+            }
+        }
+        println!("\nFreed {} to the Trash.", util::human(freed));
+    });
+
+    if failed > 0 {
+        Err(format!("{failed} item(s) could not be trashed"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_and_positionals_separate() {
+        let a = parse(&[
+            "/tmp/x".into(),
+            "--json".into(),
+            "--min".into(),
+            "1024".into(),
+            "/tmp/y".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.positional, vec!["/tmp/x", "/tmp/y"]);
+        assert!(a.json);
+        assert_eq!(a.min, 1024);
+        assert!(!a.full && !a.yes && !a.allow_any);
+    }
+
+    #[test]
+    fn unknown_flags_are_an_error_not_a_path() {
+        assert!(parse(&["--nope".into()]).is_err());
+        assert!(parse(&["--min".into()]).is_err());
+        assert!(parse(&["--min".into(), "abc".into()]).is_err());
+    }
+
+    #[test]
+    fn tilde_and_relative_paths_become_absolute() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand("~"), PathBuf::from(&home));
+        assert_eq!(expand("~/x"), PathBuf::from(&home).join("x"));
+        assert!(expand("relative").is_absolute());
+        assert_eq!(expand("/abs"), PathBuf::from("/abs"));
+    }
+}
