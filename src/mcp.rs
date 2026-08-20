@@ -336,7 +336,12 @@ fn tool_status() -> Result<Value, String> {
         .iter()
         .map(|idx| {
             let hits = caches::detect_in_index(idx);
-            let reclaimable: u64 = hits.iter().map(|h| h.size).sum();
+            let refs = crate::live::Refs::collect();
+            let reclaimable: u64 = hits
+                .iter()
+                .filter(|h| refs.protecting(&h.path).is_empty())
+                .map(|h| h.private)
+                .sum();
             let disk = util::disk_usage(&idx.root);
             json!({
                 "root": idx.root.to_string_lossy(),
@@ -382,7 +387,12 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         |_| {},
     );
     let hits = caches::detect_in_index(&result.index);
-    let reclaimable: u64 = hits.iter().map(|h| h.size).sum();
+    let refs = crate::live::Refs::collect();
+    let reclaimable: u64 = hits
+        .iter()
+        .filter(|h| refs.protecting(&h.path).is_empty())
+        .map(|h| h.private)
+        .sum();
 
     Ok(json!({
         "root": root.to_string_lossy(),
@@ -429,7 +439,7 @@ fn tool_caches(args: &Value) -> Result<Value, String> {
     let filtered: Vec<&caches::IndexHit> = all
         .iter()
         .filter(|h| h.path.starts_with(&path) || path.starts_with(&h.path))
-        .filter(|h| h.size >= min_bytes)
+        .filter(|h| h.private >= min_bytes)
         .filter(|h| {
             category
                 .as_deref()
@@ -437,15 +447,30 @@ fn tool_caches(args: &Value) -> Result<Value, String> {
         })
         .collect();
 
-    let total: u64 = filtered.iter().map(|h| h.size).sum();
+    let refs = crate::live::Refs::collect();
+    let total: u64 = filtered
+        .iter()
+        .filter(|h| refs.protecting(&h.path).is_empty())
+        .map(|h| h.private)
+        .sum();
+    let apparent: u64 = filtered.iter().map(|h| h.size).sum();
     let rows: Vec<Value> = filtered
         .iter()
         .take(limit)
         .map(|h| {
+            let shared = h.size > h.private.saturating_mul(2);
+            let in_use = refs
+                .protecting(&h.path)
+                .first()
+                .map(|(exe, r)| format!("{} — {}", exe.display(), r.describe()));
             json!({
                 "path": h.path.to_string_lossy(),
-                "bytes": h.size,
-                "human": util::human(h.size),
+                "in_use": in_use,
+                "bytes": h.private,
+                "human": util::human(h.private),
+                "apparent_bytes": h.size,
+                "apparent_human": util::human(h.size),
+                "mostly_shared": shared,
                 "files": h.files,
                 "category": h.category.label(),
                 "note": h.note,
@@ -457,6 +482,13 @@ fn tool_caches(args: &Value) -> Result<Value, String> {
         "index": freshness_of(&idx),
         "reclaimable_bytes": total,
         "reclaimable_human": util::human(total),
+        "apparent_bytes": apparent,
+        "apparent_human": util::human(apparent),
+        "size_note": "bytes/human is what deleting would actually free. apparent_* is what \
+                      du would report; entries flagged mostly_shared occupy blocks shared \
+                      with a global package store, so removing them frees almost nothing. \
+                      An entry with in_use set holds an executable something is running or \
+                      reaching through $PATH — ds_trash refuses those.",
         "matches": filtered.len(),
         "shown": rows.len(),
         "caches": rows,
@@ -609,7 +641,11 @@ fn tool_trash(args: &Value) -> Result<Value, String> {
     let allow_any = arg_bool(args, "allow_any");
     let confirm = arg_bool(args, "confirm");
 
-    let plan = cleanup::plan(&root, &paths, allow_any);
+    let known: std::collections::HashMap<PathBuf, u64> = caches::detect_in_index(&idx)
+        .into_iter()
+        .map(|h| (h.path, h.private))
+        .collect();
+    let plan = cleanup::plan_with_sizes(&root, &paths, allow_any, |p| known.get(p).copied());
     let planned: Vec<Value> = plan
         .items
         .iter()

@@ -9,7 +9,9 @@
 //! 2. It must currently match a cache rule, checked against the filesystem —
 //!    unless the caller explicitly opted out with `allow_any`.
 //! 3. Obviously-wrong targets (a home directory, a volume root, anything with a
-//!    `..` in it, a symlink pointing out of the root) are refused outright.
+//!    `..` in it, a symlink pointing out of the root) are refused outright, as
+//!    is any directory holding an executable something else is currently using
+//!    — see [`crate::live`].
 //! 4. Everything is re-verified at the moment of deletion, so a stale index
 //!    cannot cause the wrong thing to go.
 //! 5. Deletion always means the macOS Trash. There is no hard-delete path here.
@@ -17,6 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::caches::{self, Category};
+use crate::live;
 
 /// A single vetted deletion target.
 pub struct Item {
@@ -53,6 +56,10 @@ pub struct Outcome {
 }
 
 /// Directory size on disk, counted the same way the scanner counts it.
+///
+/// Only used when the caller has no better answer. Walking a large tree just to
+/// report "would free N bytes" is far more expensive than the deletion itself,
+/// so callers holding an index should pass sizes to [`plan_with_sizes`] instead.
 pub fn measure(path: &Path) -> u64 {
     let mut total = 0u64;
     let walk = jwalk::WalkDir::new(path)
@@ -85,7 +92,24 @@ fn home() -> Option<PathBuf> {
 
 /// Reject targets that no rule should ever be able to reach, regardless of what
 /// the caller claims. Returns `Some(reason)` when the path must not be touched.
-fn structural_objection(path: &Path, root: &Path) -> Option<String> {
+fn structural_objection(path: &Path, root: &Path, refs: &live::Refs) -> Option<String> {
+    // A build directory that something is running from, or that a $PATH symlink
+    // points into, is not regenerable in the way the rules assume: deleting it
+    // breaks a working tool instead of costing a rebuild. `allow_any` does not
+    // lift this, for the same reason it does not lift the other guards here.
+    let in_use = refs.protecting(path);
+    if let Some((exe, reason)) = in_use.first() {
+        return Some(format!(
+            "in use: {} ({}){}",
+            exe.display(),
+            reason.describe(),
+            if in_use.len() > 1 {
+                format!(" and {} other executable(s)", in_use.len() - 1)
+            } else {
+                String::new()
+            }
+        ));
+    }
     if !path.is_absolute() {
         return Some("path is not absolute".into());
     }
@@ -123,15 +147,33 @@ fn structural_objection(path: &Path, root: &Path) -> Option<String> {
     None
 }
 
+/// Like [`plan_with_sizes`] but measures each target, for callers with no index.
+#[cfg(test)]
+pub fn plan(root: &Path, paths: &[PathBuf], allow_any: bool) -> Plan {
+    plan_with_sizes(root, paths, allow_any, |_| None)
+}
+
 /// Vet a batch of deletion targets against `root`. Nothing is deleted here.
 ///
 /// `allow_any` lifts only the "must be a recognised cache" requirement — every
 /// other guard still applies. Callers exposing this to an agent should treat it
 /// as something a person has to ask for by name.
-pub fn plan(root: &Path, paths: &[PathBuf], allow_any: bool) -> Plan {
+///
+/// Sizes come from `size_of` — typically the cached index — rather than a fresh
+/// walk of every target; returning `None` falls back to measuring that one path.
+pub fn plan_with_sizes(
+    root: &Path,
+    paths: &[PathBuf],
+    allow_any: bool,
+    size_of: impl Fn(&Path) -> Option<u64>,
+) -> Plan {
     let mut out = Plan::default();
+    let sized = |p: &Path| size_of(p).unwrap_or_else(|| measure(p));
+    // Collected once: it costs a listing of every $PATH directory plus one pass
+    // over the process table, which is far too much to repeat per target.
+    let refs = live::Refs::collect();
     for p in paths {
-        if let Some(reason) = structural_objection(p, root) {
+        if let Some(reason) = structural_objection(p, root, &refs) {
             out.rejected.push(Rejected {
                 path: p.clone(),
                 reason,
@@ -148,13 +190,13 @@ pub fn plan(root: &Path, paths: &[PathBuf], allow_any: bool) -> Plan {
         match caches::classify_path(p) {
             Some((category, note)) => out.items.push(Item {
                 path: p.clone(),
-                bytes: measure(p),
+                bytes: sized(p),
                 category: Some(category),
                 note: Some(note),
             }),
             None if allow_any => out.items.push(Item {
                 path: p.clone(),
-                bytes: measure(p),
+                bytes: sized(p),
                 category: None,
                 note: None,
             }),
@@ -173,8 +215,11 @@ pub fn plan(root: &Path, paths: &[PathBuf], allow_any: bool) -> Plan {
 /// this is the last moment at which the filesystem can still be consulted.
 pub fn execute(root: &Path, items: &[Item], allow_any: bool) -> Vec<Outcome> {
     let mut out = Vec::with_capacity(items.len());
+    // Re-collected here rather than carried from `plan`: something may have
+    // started running from one of these directories in between.
+    let refs = live::Refs::collect();
     for item in items {
-        if let Some(reason) = structural_objection(&item.path, root) {
+        if let Some(reason) = structural_objection(&item.path, root, &refs) {
             out.push(Outcome {
                 path: item.path.clone(),
                 bytes: 0,
@@ -291,12 +336,36 @@ mod tests {
     #[test]
     fn refuses_shallow_and_home_paths() {
         let base = tmp("shallow");
-        assert!(structural_objection(Path::new("/"), Path::new("/")).is_some());
-        assert!(structural_objection(Path::new("/Users"), Path::new("/")).is_some());
+        let refs = live::Refs::collect();
+        assert!(structural_objection(Path::new("/"), Path::new("/"), &refs).is_some());
+        assert!(structural_objection(Path::new("/Users"), Path::new("/"), &refs).is_some());
         if let Some(h) = home() {
-            assert!(structural_objection(&h, Path::new("/")).is_some());
+            assert!(structural_objection(&h, Path::new("/"), &refs).is_some());
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refuses_a_directory_something_is_running_from() {
+        // The concrete case this exists for: `cargo build --release` leaves a
+        // binary in target/release/, a symlink on $PATH points at it, and the
+        // cache rules would happily offer the whole directory for deletion.
+        let refs = live::Refs::collect();
+        let me = std::env::current_exe().unwrap();
+        let dir = me.parent().unwrap();
+        let objection = structural_objection(dir, Path::new("/"), &refs);
+        let msg = objection.expect("a directory we are running from must be refused");
+        assert!(msg.starts_with("in use:"), "{msg}");
+    }
+
+    #[test]
+    fn allow_any_does_not_lift_the_in_use_guard() {
+        let me = std::env::current_exe().unwrap();
+        let dir = me.parent().unwrap().to_path_buf();
+        // Root it at "/" so only the in-use guard can be what rejects it.
+        let p = plan(Path::new("/"), std::slice::from_ref(&dir), true);
+        assert!(p.items.is_empty());
+        assert!(p.rejected[0].reason.starts_with("in use:"));
     }
 
     #[test]

@@ -32,8 +32,8 @@ in, hover for details:
 ![DiskScour — treemap](assets/demo-treemap.png)
 
 > Caches are matched in context (a `target/` only counts next to a `Cargo.toml`, etc.) and
-> nested caches are de-duplicated, so the "reclaimable" number is honest. Selected items go
-> to the **macOS Trash** — recoverable, never a hard delete, always behind a confirmation.
+> nested caches are de-duplicated. Selected items go to the **macOS Trash** — recoverable,
+> never a hard delete, always behind a confirmation.
 
 ## Run it
 
@@ -93,6 +93,53 @@ strategy produced it, so the numbers never arrive without their provenance.
 The one thing incremental refresh can miss is a file that grows *in place*
 without its directory changing. `--full` corrects that on demand, and an index
 older than a week does a full scan on its own.
+
+## The reclaimable number means what it says
+
+Ask `du` how big thirteen `bun`-installed `node_modules` are and it will tell you 34 GB.
+Delete them and you get back nothing. On APFS a block can belong to several files at once —
+`clonefile(2)`, which `bun install` and `cp -c` use, gives each copy its own inode pointing
+at shared extents — and `st_blocks` counts those blocks once per file. Every tool built on
+`du`'s arithmetic inherits the error.
+
+DiskScour reads `ATTR_CMNEXT_PRIVATESIZE` instead: the bytes a file does *not* share with
+any other file, which is exactly what deleting it would free. On one real machine:
+
+```
+             apparent (what du reports)   76.4 GB
+             actually reclaimable         20.7 GB
+```
+
+Both numbers are shown, and anything whose apparent size is mostly shared says so:
+
+```
+171.7 MB  [JavaScript / TypeScript] …/worktrees/org-channels-p15/node_modules
+                                    (looks like 2.6 GB, mostly shared)
+```
+
+It comes from `getattrlistbulk(2)`, which returns names *and* attributes for a whole batch
+of entries per syscall. That pays for the extra work: a full scan of 5.1M files runs in 78s
+against 80s for the same walk built from `lstat`, while also computing a figure `lstat`
+cannot produce.
+
+## It won't delete a tool you're using
+
+A `target/` directory is regenerable — unless `cargo build --release` is also how something
+got installed. The binary stays in `target/release/` and gets reached from elsewhere: a
+symlink on `$PATH`, an editor or agent configured to launch it, a process already running.
+Deleting it then breaks a working tool instead of costing a rebuild.
+
+DiskScour refuses those, and says why:
+
+```
+skipped  …/patchbay/target  (in use: …/target/release/patchbay-mcp
+                             (a process is running from it) and 1 other executable(s))
+```
+
+Checked against every symlink in a `$PATH` directory and every running process. `--allow-any`
+does not lift it — that flag only relaxes the "must be a recognised cache" rule. Nothing here
+can see a config file naming an absolute path, so this is a guard against the common cases,
+not a proof of safety.
 
 ## Use it from Claude Code
 

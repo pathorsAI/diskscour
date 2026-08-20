@@ -451,7 +451,13 @@ pub struct CacheHit {
 /// A cache detected by scanning the persistent index rather than a live tree.
 pub struct IndexHit {
     pub path: PathBuf,
+    /// Apparent size, shared blocks included — what `du` would report.
     pub size: u64,
+    /// What deleting this would actually free. For a clone-backed tree such as a
+    /// `bun`-installed `node_modules` this is near zero even when `size` is
+    /// gigabytes, because the blocks live in a global store shared with every
+    /// other checkout. Reclaim totals must use this, not `size`.
+    pub private: u64,
     pub files: u64,
     pub category: Category,
     pub note: &'static str,
@@ -503,6 +509,7 @@ pub fn detect_in_index(idx: &crate::index::Index) -> Vec<IndexHit> {
         hits.push(IndexHit {
             path: idx.path_of(i),
             size: idx.dirs[i as usize].subtree_bytes,
+            private: idx.dirs[i as usize].subtree_private,
             files: idx.dirs[i as usize].subtree_files,
             category,
             note,

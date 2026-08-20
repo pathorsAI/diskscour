@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::scan::{Node, Tree};
 
 const MAGIC: &[u8; 4] = b"DSCR";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 /// Files at or above this size get their own record; smaller ones are collapsed.
 pub const DEFAULT_THRESHOLD: u64 = 1 << 20; // 1 MiB
@@ -79,12 +79,16 @@ pub struct DirRec {
     /// Bytes/count of this directory's own files that were collapsed (below the
     /// large-file threshold). Files at or above it live in `large` instead.
     pub own_bytes: u64,
+    pub own_private: u64,
     pub own_files: u64,
     /// Aggregate over this directory and everything below it, large files included.
     pub subtree_bytes: u64,
+    /// Aggregate of bytes not shared with any file outside this subtree — what
+    /// deleting the directory would actually free. See [`crate::bulkstat`].
+    pub subtree_private: u64,
     pub subtree_files: u64,
-    /// Individually-tracked files directly in this directory: (name, bytes).
-    pub large: Vec<(String, u64)>,
+    /// Individually-tracked files directly in this directory: (name, bytes, private).
+    pub large: Vec<(String, u64, u64)>,
 }
 
 pub struct Index {
@@ -232,13 +236,16 @@ impl Index {
             put_str(&mut out, &d.name);
             put_i64(&mut out, d.mtime_ns);
             put_u64(&mut out, d.own_bytes);
+            put_u64(&mut out, d.own_private);
             put_u64(&mut out, d.own_files);
             put_u64(&mut out, d.subtree_bytes);
+            put_u64(&mut out, d.subtree_private);
             put_u64(&mut out, d.subtree_files);
             put_u32(&mut out, d.large.len() as u32);
-            for (name, sz) in &d.large {
+            for (name, sz, pv) in &d.large {
                 put_str(&mut out, name);
                 put_u64(&mut out, *sz);
+                put_u64(&mut out, *pv);
             }
         }
         out
@@ -269,23 +276,28 @@ impl Index {
             let name = c.string()?;
             let mtime_ns = c.i64()?;
             let own_bytes = c.u64()?;
+            let own_private = c.u64()?;
             let own_files = c.u64()?;
             let subtree_bytes = c.u64()?;
+            let subtree_private = c.u64()?;
             let subtree_files = c.u64()?;
             let ln = c.u32()? as usize;
             let mut large = Vec::with_capacity(ln.min(1 << 16));
             for _ in 0..ln {
                 let nm = c.string()?;
                 let sz = c.u64()?;
-                large.push((nm, sz));
+                let pv = c.u64()?;
+                large.push((nm, sz, pv));
             }
             dirs.push(DirRec {
                 parent,
                 name,
                 mtime_ns,
                 own_bytes,
+                own_private,
                 own_files,
                 subtree_bytes,
+                subtree_private,
                 subtree_files,
                 large,
             });
@@ -347,6 +359,11 @@ impl Index {
 
     pub fn total_bytes(&self) -> u64 {
         self.dirs[self.root_ix as usize].subtree_bytes
+    }
+
+    /// Bytes that deleting the whole root would actually free.
+    pub fn total_private(&self) -> u64 {
+        self.dirs[self.root_ix as usize].subtree_private
     }
 
     pub fn total_files(&self) -> u64 {
@@ -417,8 +434,9 @@ pub fn from_tree(tree: &Tree, mode: Mode, last_event_id: u64, threshold: u64) ->
         let rec_ix = dirs.len() as u32;
         map.insert(node_ix, rec_ix);
         let mut own_bytes = 0u64;
+        let mut own_private = 0u64;
         let mut own_files = 0u64;
-        let mut large: Vec<(String, u64)> = Vec::new();
+        let mut large: Vec<(String, u64, u64)> = Vec::new();
         for &c in &n.children {
             let ch = &tree.nodes[c];
             if ch.removed {
@@ -427,11 +445,12 @@ pub fn from_tree(tree: &Tree, mode: Mode, last_event_id: u64, threshold: u64) ->
             if ch.is_dir {
                 queue.push((c, Some(rec_ix)));
             } else if ch.size >= threshold && !ch.synthetic {
-                large.push((ch.name.clone(), ch.size));
+                large.push((ch.name.clone(), ch.size, ch.private));
             } else {
                 // Small files, and any synthetic "N small files" node carried over
                 // from a previous index, fold back into the collapsed totals.
                 own_bytes += ch.size;
+                own_private += ch.private;
                 own_files += ch.file_count;
             }
         }
@@ -440,8 +459,10 @@ pub fn from_tree(tree: &Tree, mode: Mode, last_event_id: u64, threshold: u64) ->
             name: n.name.clone(),
             mtime_ns: n.mtime_ns,
             own_bytes,
+            own_private,
             own_files,
             subtree_bytes: n.size,
+            subtree_private: n.private,
             subtree_files: n.file_count,
             large,
         });
@@ -470,6 +491,7 @@ pub fn to_tree(idx: &Index) -> Tree {
         let n = Node {
             name: d.name.clone(),
             size: d.subtree_bytes,
+            private: d.subtree_private,
             is_dir: true,
             parent: None,
             children: Vec::new(),
@@ -492,11 +514,12 @@ pub fn to_tree(idx: &Index) -> Tree {
     // Attach files: individually for large ones, collapsed for the rest.
     for (i, d) in idx.dirs.iter().enumerate() {
         let pi = map[i];
-        for (name, sz) in &d.large {
+        for (name, sz, pv) in &d.large {
             let fi = nodes.len();
             nodes.push(Node {
                 name: name.clone(),
                 size: *sz,
+                private: *pv,
                 is_dir: false,
                 parent: Some(pi),
                 children: Vec::new(),
@@ -512,6 +535,7 @@ pub fn to_tree(idx: &Index) -> Tree {
             nodes.push(Node {
                 name: format!("({} small files)", d.own_files),
                 size: d.own_bytes,
+                private: d.own_private,
                 is_dir: false,
                 parent: Some(pi),
                 children: Vec::new(),
@@ -553,18 +577,22 @@ mod tests {
                     name: "ds-test".into(),
                     mtime_ns: 1234,
                     own_bytes: 100,
+                    own_private: 100,
                     own_files: 2,
                     subtree_bytes: 5100,
+                    subtree_private: 1100,
                     subtree_files: 4,
-                    large: vec![("big.bin".into(), 4000)],
+                    large: vec![("big.bin".into(), 4000, 0)],
                 },
                 DirRec {
                     parent: Some(0),
                     name: "sub".into(),
                     mtime_ns: 5678,
                     own_bytes: 1000,
+                    own_private: 1000,
                     own_files: 1,
                     subtree_bytes: 1000,
+                    subtree_private: 1000,
                     subtree_files: 1,
                     large: vec![],
                 },
@@ -583,7 +611,8 @@ mod tests {
         assert_eq!(back.device_id, 42);
         assert_eq!(back.last_event_id, 999);
         assert_eq!(back.dirs.len(), 2);
-        assert_eq!(back.dirs[0].large, vec![("big.bin".to_string(), 4000)]);
+        assert_eq!(back.dirs[0].large, vec![("big.bin".to_string(), 4000, 0)]);
+        assert_eq!(back.total_private(), 1100);
         assert_eq!(back.dirs[1].name, "sub");
         assert_eq!(back.total_bytes(), 5100);
     }

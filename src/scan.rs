@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::bulkstat;
 use crate::index::Index;
 
 /// How often to publish an intermediate snapshot while a scan is running.
@@ -32,8 +33,14 @@ pub struct ScanProgress {
 #[derive(Clone)]
 pub struct Node {
     pub name: String,
-    /// Allocated bytes: self size for files, aggregated for directories.
+    /// Allocated bytes: self size for files, aggregated for directories. Blocks
+    /// shared with a clone elsewhere are counted here, so this is what `du`
+    /// reports — "how big does this look".
     pub size: u64,
+    /// Bytes not shared with any other file — what deleting this actually frees.
+    /// Equal to `size` for ordinary files; far smaller for clone-backed trees
+    /// like a `bun`-installed `node_modules`. See [`crate::bulkstat`].
+    pub private: u64,
     pub is_dir: bool,
     pub parent: Option<usize>,
     pub children: Vec<usize>,
@@ -102,6 +109,7 @@ impl Tree {
             return;
         }
         let size = self.nodes[idx].size;
+        let priv_sz = self.nodes[idx].private;
         let fc = self.nodes[idx].file_count;
         if let Some(p) = self.nodes[idx].parent {
             self.nodes[p].children.retain(|&c| c != idx);
@@ -109,6 +117,7 @@ impl Tree {
         let mut cur = self.nodes[idx].parent;
         while let Some(p) = cur {
             self.nodes[p].size = self.nodes[p].size.saturating_sub(size);
+            self.nodes[p].private = self.nodes[p].private.saturating_sub(priv_sz);
             self.nodes[p].file_count = self.nodes[p].file_count.saturating_sub(fc);
             cur = self.nodes[p].parent;
         }
@@ -125,28 +134,57 @@ impl Tree {
     }
 }
 
-/// Allocated size of a file, counting each hardlinked inode only once.
+/// Count a multiply-linked inode only the first time it is seen. Hardlinks share
+/// one inode under several names, so without this a `pnpm` store or a Time
+/// Machine local snapshot would inflate the totals by its link count.
+///
+/// This is a separate concern from clone sharing: hardlinks are one inode with
+/// many names (visible in `nlink`), clones are many inodes over shared blocks
+/// (visible only in the private-byte figure).
+fn dedup_hardlink(
+    allocated: u64,
+    private: u64,
+    dev: u64,
+    ino: u64,
+    nlink: u32,
+    seen: &Mutex<HashSet<(u64, u64)>>,
+) -> (u64, u64) {
+    if nlink > 1 {
+        let mut s = seen.lock().unwrap();
+        if !s.insert((dev, ino)) {
+            return (0, 0);
+        }
+    }
+    (allocated, private)
+}
+
+/// Fallback for filesystems without `getattrlistbulk`. Without the private-byte
+/// figure the best available answer is the allocated size, which is what every
+/// other tool reports.
 #[cfg(unix)]
-fn counted_size(md: &std::fs::Metadata, seen: &Mutex<HashSet<(u64, u64)>>) -> u64 {
+fn counted_size(md: &std::fs::Metadata, seen: &Mutex<HashSet<(u64, u64)>>) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     let sz = md.blocks().saturating_mul(512);
-    if md.nlink() > 1 {
-        // Count a multiply-linked inode only the first time we encounter it,
-        // so pnpm stores / Time Machine local snapshots don't inflate totals.
-        let mut s = seen.lock().unwrap();
-        if s.insert((md.dev(), md.ino())) {
-            sz
-        } else {
-            0
-        }
-    } else {
-        sz
-    }
+    dedup_hardlink(sz, sz, md.dev(), md.ino(), md.nlink() as u32, seen)
 }
 
 #[cfg(not(unix))]
-fn counted_size(md: &std::fs::Metadata, _seen: &Mutex<HashSet<(u64, u64)>>) -> u64 {
-    md.len()
+fn counted_size(md: &std::fs::Metadata, _seen: &Mutex<HashSet<(u64, u64)>>) -> (u64, u64) {
+    (md.len(), md.len())
+}
+
+/// Device id of the filesystem holding `path`, for hardlink identity.
+fn device_of(path: &Path) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).map(|m| m.dev()).unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        0
+    }
 }
 
 fn file_label(path: &Path) -> String {
@@ -159,6 +197,7 @@ fn new_dir(name: String) -> Node {
     Node {
         name,
         size: 0,
+        private: 0,
         is_dir: true,
         parent: None,
         children: Vec::new(),
@@ -185,6 +224,7 @@ struct DirInfo {
 #[derive(Clone, Debug, Default)]
 struct EntryState {
     size: u64,
+    private: u64,
     reused: Option<u32>,
 }
 
@@ -270,6 +310,9 @@ fn scan_impl(
     // when the corresponding node is built. One lock per directory, not per file.
     let dir_info: Arc<Mutex<HashMap<PathBuf, DirInfo>>> = Arc::new(Mutex::new(HashMap::new()));
     let di = dir_info.clone();
+    // One device id for the whole walk. Hardlink identity is (device, inode),
+    // and a `stat` per directory just to re-learn the same number is waste.
+    let root_dev = device_of(&root);
 
     // Read-only lookups shared with the walk threads.
     let prior_paths: Arc<HashMap<PathBuf, u32>> = Arc::new(match &reuse {
@@ -292,9 +335,19 @@ fn scan_impl(
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |_depth, path, _state, children| {
-            // One stat per directory, on the walk pool. Its result is needed both
-            // to decide reuse here and to record the mtime in the next index.
-            let mtime = dir_mtime_ns(path);
+            // A directory's own mtime was recorded when its parent was read, so
+            // there is no stat here; only the scan root has to be asked directly.
+            let mtime = di
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|d: &DirInfo| d.mtime_ns)
+                .unwrap_or(0);
+            let mtime = if mtime == 0 {
+                dir_mtime_ns(path)
+            } else {
+                mtime
+            };
             let rec = prior_paths.get(path).copied();
             // Same directory, same mtime → its direct entries are unchanged, so
             // the sizes of its own files can come from the index.
@@ -317,6 +370,32 @@ fn scan_impl(
                 children.retain(|e| e.as_ref().map(|e| e.file_type.is_dir()).unwrap_or(false));
             }
 
+            // One `getattrlistbulk` call yields every child's size, replacing a
+            // stat per file — and it is the only source of the private-byte
+            // figure. Falls back to per-file stat where it is unavailable.
+            let bulk: Option<HashMap<String, (u64, u64, u64, u32)>> = if files_cached {
+                None
+            } else {
+                bulkstat::read_dir(path).map(|entries| {
+                    let mut files = HashMap::new();
+                    let mut info = di.lock().unwrap();
+                    for e in entries {
+                        if e.is_file {
+                            files.insert(e.name, (e.allocated, e.private, e.fileid, e.nlink));
+                        } else if e.mtime_ns != 0 {
+                            // Hand each child directory its mtime now, so the
+                            // pass that reads it does not need a stat of its own.
+                            info.entry(path.join(&e.name)).or_insert(DirInfo {
+                                mtime_ns: e.mtime_ns,
+                                files_cached: false,
+                            });
+                        }
+                    }
+                    files
+                })
+            };
+            let dev = root_dev;
+
             for entry in children.iter_mut().flatten() {
                 if entry.file_type.is_dir() {
                     // A directory with no changed path at or below it can be served
@@ -330,13 +409,22 @@ fn scan_impl(
                             entry.read_children_path = None;
                         }
                     }
-                } else if entry.file_type.is_file()
-                    && let Ok(md) = std::fs::symlink_metadata(entry.path())
-                {
-                    let sz = counted_size(&md, &hl);
-                    entry.client_state.size = sz;
-                    prog.files.fetch_add(1, Ordering::Relaxed);
-                    prog.bytes.fetch_add(sz, Ordering::Relaxed);
+                } else if entry.file_type.is_file() {
+                    let name = entry.file_name.to_string_lossy();
+                    let sized = match bulk.as_ref().and_then(|m| m.get(name.as_ref())) {
+                        Some(&(alloc, private, ino, nlink)) => {
+                            Some(dedup_hardlink(alloc, private, dev, ino, nlink, &hl))
+                        }
+                        None => std::fs::symlink_metadata(entry.path())
+                            .ok()
+                            .map(|md| counted_size(&md, &hl)),
+                    };
+                    if let Some((sz, priv_sz)) = sized {
+                        entry.client_state.size = sz;
+                        entry.client_state.private = priv_sz;
+                        prog.files.fetch_add(1, Ordering::Relaxed);
+                        prog.bytes.fetch_add(sz, Ordering::Relaxed);
+                    }
                 }
             }
         });
@@ -371,6 +459,7 @@ fn scan_impl(
         nodes[idx].is_dir = is_dir;
         if !is_dir {
             nodes[idx].size = entry.client_state.size;
+            nodes[idx].private = entry.client_state.private;
             nodes[idx].file_count = 1;
         }
         if path != root
@@ -454,11 +543,12 @@ fn attach_cached_files(
     progress: &ScanProgress,
 ) {
     let d = &prior.dirs[rec as usize];
-    for (name, sz) in &d.large {
+    for (name, sz, pv) in &d.large {
         let fi = nodes.len();
         nodes.push(Node {
             name: name.clone(),
             size: *sz,
+            private: *pv,
             is_dir: false,
             parent: Some(parent),
             children: Vec::new(),
@@ -476,6 +566,7 @@ fn attach_cached_files(
         nodes.push(Node {
             name: format!("({} small files)", d.own_files),
             size: d.own_bytes,
+            private: d.own_private,
             is_dir: false,
             parent: Some(parent),
             children: Vec::new(),
@@ -506,6 +597,7 @@ fn attach_cached_subtree(
         nodes.push(Node {
             name: d.name.clone(),
             size: 0,
+            private: 0,
             is_dir: true,
             parent: Some(parent),
             children: Vec::new(),
@@ -540,13 +632,16 @@ fn aggregate(nodes: &mut [Node], root: usize) {
     while let Some((i, processed)) = stack.pop() {
         if processed {
             let mut total = nodes[i].size;
+            let mut priv_total = nodes[i].private;
             let mut fc = nodes[i].file_count;
             for k in 0..nodes[i].children.len() {
                 let ch = nodes[i].children[k];
                 total += nodes[ch].size;
+                priv_total += nodes[ch].private;
                 fc += nodes[ch].file_count;
             }
             nodes[i].size = total;
+            nodes[i].private = priv_total;
             nodes[i].file_count = fc;
         } else {
             stack.push((i, true));

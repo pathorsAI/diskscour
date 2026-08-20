@@ -2,12 +2,14 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod bulkstat;
 mod caches;
 mod cleanup;
 mod cli;
 mod engine;
 mod fsevents;
 mod index;
+mod live;
 mod mcp;
 mod scan;
 mod treemap;

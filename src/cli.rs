@@ -13,6 +13,7 @@ use crate::caches;
 use crate::cleanup;
 use crate::engine::{self, Freshness};
 use crate::index::Index;
+use crate::live;
 use crate::scan::ScanProgress;
 use crate::util;
 
@@ -152,7 +153,20 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
         |_| {},
     );
     let hits = caches::detect_in_index(&r.index);
-    let reclaimable: u64 = hits.iter().map(|h| h.size).sum();
+    let refs = live::Refs::collect();
+    // Reclaimable counts only what deleting would really free: the private
+    // figure, and only for directories nothing is using.
+    let reclaimable: u64 = hits
+        .iter()
+        .filter(|h| refs.protecting(&h.path).is_empty())
+        .map(|h| h.private)
+        .sum();
+    let in_use: u64 = hits
+        .iter()
+        .filter(|h| !refs.protecting(&h.path).is_empty())
+        .map(|h| h.private)
+        .sum();
+    let apparent: u64 = hits.iter().map(|h| h.size).sum();
     let total = r.index.total_bytes();
 
     let value = json!({
@@ -162,6 +176,10 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
         "files": r.index.total_files(),
         "reclaimable_bytes": reclaimable,
         "reclaimable_human": util::human(reclaimable),
+        "apparent_bytes": apparent,
+        "apparent_human": util::human(apparent),
+        "in_use_bytes": in_use,
+        "in_use_human": util::human(in_use),
         "cache_dirs": hits.len(),
         "seconds": (r.secs * 100.0).round() / 100.0,
         "mode": r.mode.as_str(),
@@ -170,8 +188,13 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
         "index_saved": r.saved,
         "largest": hits.iter().take(25).map(|h| json!({
             "path": h.path.to_string_lossy(),
-            "bytes": h.size,
-            "human": util::human(h.size),
+            "in_use": refs.protecting(&h.path).first().map(|(exe, r)|
+                format!("{} — {}", exe.display(), r.describe())),
+            "bytes": h.private,
+            "human": util::human(h.private),
+            "apparent_bytes": h.size,
+            "apparent_human": util::human(h.size),
+            "shared": h.size > h.private.saturating_mul(2),
             "category": h.category.label(),
         })).collect::<Vec<_>>(),
     });
@@ -187,17 +210,35 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
             r.reason
         );
         println!(
-            "Dev caches: {} reclaimable across {} dirs",
+            "Dev caches: {} reclaimable across {} dirs  ({} apparent{})",
             util::human(reclaimable),
-            hits.len()
+            hits.len(),
+            util::human(apparent),
+            if in_use > 0 {
+                format!(", {} in use", util::human(in_use))
+            } else {
+                String::new()
+            }
         );
-        for h in hits.iter().take(25) {
+        let mut by_private: Vec<&caches::IndexHit> = hits.iter().collect();
+        by_private.sort_by_key(|h| std::cmp::Reverse(h.private));
+        for h in by_private.iter().take(25) {
             let rel = h.path.strip_prefix(&root).unwrap_or(&h.path);
+            // Flag entries whose apparent size is mostly shared blocks, so the
+            // gap between the two numbers never looks like a mistake.
+            let note = if let Some((exe, r)) = refs.protecting(&h.path).first() {
+                format!("  ⚠ IN USE: {} — {}", exe.display(), r.describe())
+            } else if h.size > h.private.saturating_mul(2) {
+                format!(" (looks like {}, mostly shared)", util::human(h.size))
+            } else {
+                String::new()
+            };
             println!(
-                "  {:>10}  [{}] {}",
-                util::human(h.size),
+                "  {:>10}  [{}] {}{}",
+                util::human(h.private),
                 h.category.label(),
-                rel.display()
+                rel.display(),
+                note
             );
         }
     });
@@ -223,9 +264,15 @@ fn cmd_caches(a: &Args) -> Result<(), String> {
     let hits: Vec<&caches::IndexHit> = all
         .iter()
         .filter(|h| h.path.starts_with(&path) || path.starts_with(&h.path))
-        .filter(|h| h.size >= a.min)
+        .filter(|h| h.private >= a.min)
         .collect();
-    let total: u64 = hits.iter().map(|h| h.size).sum();
+    let refs = live::Refs::collect();
+    let total: u64 = hits
+        .iter()
+        .filter(|h| refs.protecting(&h.path).is_empty())
+        .map(|h| h.private)
+        .sum();
+    let apparent: u64 = hits.iter().map(|h| h.size).sum();
 
     let value = json!({
         "root": idx.root.to_string_lossy(),
@@ -234,10 +281,17 @@ fn cmd_caches(a: &Args) -> Result<(), String> {
         "mode": idx.mode.as_str(),
         "reclaimable_bytes": total,
         "reclaimable_human": util::human(total),
+        "apparent_bytes": apparent,
+        "apparent_human": util::human(apparent),
         "caches": hits.iter().map(|h| json!({
             "path": h.path.to_string_lossy(),
-            "bytes": h.size,
-            "human": util::human(h.size),
+            "in_use": refs.protecting(&h.path).first().map(|(exe, r)|
+                format!("{} — {}", exe.display(), r.describe())),
+            "bytes": h.private,
+            "human": util::human(h.private),
+            "apparent_bytes": h.size,
+            "apparent_human": util::human(h.size),
+            "shared": h.size > h.private.saturating_mul(2),
             "files": h.files,
             "category": h.category.label(),
             "note": h.note,
@@ -246,17 +300,26 @@ fn cmd_caches(a: &Args) -> Result<(), String> {
 
     emit(a.json, &value, || {
         println!(
-            "{} reclaimable across {} dirs under {}",
+            "{} reclaimable across {} dirs under {}  ({} apparent)",
             util::human(total),
             hits.len(),
-            path.display()
+            path.display(),
+            util::human(apparent)
         );
         for h in &hits {
+            let note = if let Some((exe, r)) = refs.protecting(&h.path).first() {
+                format!("  ⚠ IN USE: {} — {}", exe.display(), r.describe())
+            } else if h.size > h.private.saturating_mul(2) {
+                format!(" (looks like {}, mostly shared)", util::human(h.size))
+            } else {
+                String::new()
+            };
             println!(
-                "  {:>10}  [{}] {}",
-                util::human(h.size),
+                "  {:>10}  [{}] {}{}",
+                util::human(h.private),
                 h.category.label(),
-                h.path.display()
+                h.path.display(),
+                note
             );
         }
     });
@@ -271,11 +334,18 @@ fn cmd_status(a: &Args) -> Result<(), String> {
         .iter()
         .map(|idx| {
             let hits = caches::detect_in_index(idx);
-            let recl: u64 = hits.iter().map(|h| h.size).sum();
+            let refs = live::Refs::collect();
+            let recl: u64 = hits
+                .iter()
+                .filter(|h| refs.protecting(&h.path).is_empty())
+                .map(|h| h.private)
+                .sum();
             json!({
                 "root": idx.root.to_string_lossy(),
                 "total_bytes": idx.total_bytes(),
                 "total_human": util::human(idx.total_bytes()),
+                "unshared_bytes": idx.total_private(),
+                "unshared_human": util::human(idx.total_private()),
                 "files": idx.total_files(),
                 "reclaimable_bytes": recl,
                 "reclaimable_human": util::human(recl),
@@ -314,7 +384,13 @@ fn cmd_trash(a: &Args) -> Result<(), String> {
     let idx = require_index(&paths[0])?;
     let root = idx.root.clone();
 
-    let plan = cleanup::plan(&root, &paths, a.allow_any);
+    // Sizes come from the index. Re-walking every target just to print a total
+    // costs far more than the deletion, and at a few hundred paths it dominates.
+    let known: std::collections::HashMap<PathBuf, u64> = caches::detect_in_index(&idx)
+        .into_iter()
+        .map(|h| (h.path, h.private))
+        .collect();
+    let plan = cleanup::plan_with_sizes(&root, &paths, a.allow_any, |p| known.get(p).copied());
     for r in &plan.rejected {
         eprintln!("  skipped  {}  ({})", r.path.display(), r.reason);
     }
