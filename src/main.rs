@@ -186,6 +186,11 @@ struct DiskScourApp {
     mcp_open: bool,
 }
 
+/// Badge and panel colours for the MCP status: registered and current, or
+/// registered but pointing somewhere stale.
+const MCP_OK: Color32 = Color32::from_rgb(0x3d, 0x9a, 0x5c);
+const MCP_WARN: Color32 = Color32::from_rgb(0xd4, 0x9a, 0x1e);
+
 /// How often the MCP status line re-reads the agent config and process table.
 const MCP_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
 
@@ -655,14 +660,8 @@ impl DiskScourApp {
             return;
         };
         let (dot, text) = match st.level() {
-            registration::Level::Ok => (
-                Color32::from_rgb(0x3d, 0x9a, 0x5c),
-                ui.visuals().text_color(),
-            ),
-            registration::Level::Warn => (
-                Color32::from_rgb(0xd4, 0x9a, 0x1e),
-                ui.visuals().text_color(),
-            ),
+            registration::Level::Ok => (MCP_OK, ui.visuals().text_color()),
+            registration::Level::Warn => (MCP_WARN, ui.visuals().text_color()),
             registration::Level::Off => (
                 ui.visuals().weak_text_color(),
                 ui.visuals().weak_text_color(),
@@ -722,72 +721,89 @@ impl DiskScourApp {
                      how many sessions are talking to it.",
                 );
                 ui.add_space(6.0);
-                egui::Grid::new("mcp-grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
-                    ui.weak("This build");
-                    ui.label(format!("v{}  {}", st.this_version, st.this_binary.display()));
-                    ui.end_row();
+                egui::Grid::new("mcp-grid")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.weak("This build");
+                        ui.label(format!(
+                            "v{}  {}",
+                            st.this_version,
+                            st.this_binary.display()
+                        ));
+                        ui.end_row();
 
-                    ui.weak("Registered");
-                    if st.registrations.is_empty() {
-                        ui.label("no — Claude Code does not know about DiskScour yet");
-                    } else {
-                        ui.vertical(|ui| {
-                            for reg in &st.registrations {
-                                let ok = reg.health == registration::Health::Ok;
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "{} · {} · {} {}",
-                                        reg.client,
-                                        reg.scope,
-                                        reg.command.display(),
-                                        reg.args.join(" ")
-                                    ));
-                                    let detail = reg.health.describe(st.this_version);
-                                    if ok {
-                                        ui.colored_label(Color32::from_rgb(0x3d, 0x9a, 0x5c), detail);
-                                    } else {
-                                        ui.colored_label(Color32::from_rgb(0xd4, 0x9a, 0x1e), detail);
-                                    }
-                                });
-                            }
+                        ui.weak("Registered");
+                        Self::ui_mcp_registrations(ui, &st);
+                        ui.end_row();
+
+                        ui.weak("Sessions");
+                        ui.label(match st.sessions.len() {
+                            0 => "none connected".to_string(),
+                            n => format!("{n} connected · {}", st.sessions_by_client()),
                         });
-                    }
-                    ui.end_row();
-
-                    ui.weak("Sessions");
-                    ui.label(match st.sessions.len() {
-                        0 => "none connected".to_string(),
-                        n => format!("{n} connected · {}", st.sessions_by_client()),
+                        ui.end_row();
                     });
-                    ui.end_row();
-                });
                 ui.add_space(8.0);
-
-                let cmd = st.add_command();
-                let heading = if st.registrations.is_empty() {
-                    "Register this build with Claude Code:"
-                } else if st.level() == registration::Level::Warn {
-                    "Point Claude Code at this build (remove the old entry first with `claude mcp remove diskscour`):"
-                } else {
-                    "To register this build elsewhere:"
-                };
-                ui.label(heading);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut cmd.clone())
-                            .font(FontId::monospace(12.0))
-                            .desired_width(460.0)
-                            .interactive(false),
-                    );
-                    if ui.button("Copy").clicked() {
-                        ui.ctx().copy_text(cmd.clone());
-                    }
-                });
+                Self::ui_mcp_add_command(ui, &st);
                 ui.add_space(4.0);
-                ui.weak("Tools: ds_status, ds_scan, ds_caches, ds_top, ds_tree, ds_trash. \
-                         `diskscour status` prints the same information.");
+                ui.weak(
+                    "Tools: ds_status, ds_scan, ds_caches, ds_top, ds_tree, ds_trash. \
+                     `diskscour status` prints the same information.",
+                );
             });
         self.mcp_open = open;
+    }
+
+    /// One row per config entry that launches diskscour, with its health.
+    fn ui_mcp_registrations(ui: &mut egui::Ui, st: &registration::Status) {
+        if st.registrations.is_empty() {
+            ui.label("no — Claude Code does not know about DiskScour yet");
+            return;
+        }
+        ui.vertical(|ui| {
+            for reg in &st.registrations {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} · {} · {} {}",
+                        reg.client,
+                        reg.scope,
+                        reg.command.display(),
+                        reg.args.join(" ")
+                    ));
+                    let color = if reg.health == registration::Health::Ok {
+                        MCP_OK
+                    } else {
+                        MCP_WARN
+                    };
+                    ui.colored_label(color, reg.health.describe(st.this_version));
+                });
+            }
+        });
+    }
+
+    /// The `claude mcp add` line for the running binary, with a Copy button.
+    fn ui_mcp_add_command(ui: &mut egui::Ui, st: &registration::Status) {
+        let heading = match st.level() {
+            registration::Level::Off => "Register this build with Claude Code:",
+            registration::Level::Warn => {
+                "Point Claude Code at this build (remove the old entry first with \
+                 `claude mcp remove diskscour`):"
+            }
+            registration::Level::Ok => "To register this build elsewhere:",
+        };
+        ui.label(heading);
+        let cmd = st.add_command();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut cmd.as_str())
+                    .font(FontId::monospace(12.0))
+                    .desired_width(460.0),
+            );
+            if ui.button("Copy").clicked() {
+                ui.ctx().copy_text(cmd.clone());
+            }
+        });
     }
 
     fn ui_central(
