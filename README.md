@@ -154,6 +154,22 @@ That adds six tools: `ds_status`, `ds_scan`, `ds_caches`, `ds_top`, `ds_tree`
 and `ds_trash`. Reads are served from the index rather than by scanning, so
 asking is cheap.
 
+The server speaks MCP over **stdio** — the agent launches `diskscour mcp` as a
+child process — so there is no URL or port. What there is to know is whether
+the agent is pointed at the build you're running, and how many sessions are on
+it. The window shows that in the bottom-right corner (click it for the exact
+registration and a copyable `claude mcp add` command for *this* binary), and
+`diskscour status` prints the same:
+
+```
+MCP server  stdio · v0.5.0 · /Users/you/.local/bin/diskscour
+  registered  Claude Code · user · /Users/you/.local/bin/diskscour mcp  [ok]
+  sessions    3 connected · claude ×3
+```
+
+It warns when the registered binary is missing or a different version, which
+is the usual way an MCP tool quietly goes stale after an upgrade.
+
 Deleting is the part worth being careful about, so the guards live in the code
 rather than in a tool description:
 

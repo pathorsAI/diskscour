@@ -14,6 +14,7 @@ use crate::cleanup;
 use crate::engine::{self, Freshness};
 use crate::index::Index;
 use crate::live;
+use crate::registration;
 use crate::scan::ScanProgress;
 use crate::util;
 
@@ -356,22 +357,61 @@ fn cmd_status(a: &Args) -> Result<(), String> {
         })
         .collect();
 
-    emit(a.json, &json!({"indexed_roots": rows}), || {
-        if roots.is_empty() {
-            println!("Nothing indexed yet. Try `diskscour scan ~`.");
-            return;
-        }
-        for (idx, row) in roots.iter().zip(&rows) {
+    let mcp = registration::Status::collect();
+
+    emit(
+        a.json,
+        &json!({"indexed_roots": rows, "mcp": mcp.to_json()}),
+        || {
+            if roots.is_empty() {
+                println!("Nothing indexed yet. Try `diskscour scan ~`.");
+            }
+            for (idx, row) in roots.iter().zip(&rows) {
+                println!(
+                    "{:>10}  {:>10} reclaimable  {:>6}  {}",
+                    util::human(idx.total_bytes()),
+                    row["reclaimable_human"].as_str().unwrap_or("-"),
+                    idx.mode.as_str(),
+                    idx.root.display()
+                );
+            }
+            println!();
+            print_mcp(&mcp);
+        },
+    );
+    Ok(())
+}
+
+/// The MCP block of `diskscour status`: transport, registration, sessions.
+fn print_mcp(mcp: &registration::Status) {
+    println!(
+        "MCP server  stdio · v{} · {}",
+        mcp.this_version,
+        mcp.this_binary.display()
+    );
+    if mcp.registrations.is_empty() {
+        println!("  not registered with Claude Code. To add it:");
+        println!("    {}", mcp.add_command());
+    } else {
+        for r in &mcp.registrations {
             println!(
-                "{:>10}  {:>10} reclaimable  {:>6}  {}",
-                util::human(idx.total_bytes()),
-                row["reclaimable_human"].as_str().unwrap_or("-"),
-                idx.mode.as_str(),
-                idx.root.display()
+                "  registered  {} · {} · {} {}  [{}]",
+                r.client,
+                r.scope,
+                r.command.display(),
+                r.args.join(" "),
+                r.health.describe(mcp.this_version)
             );
         }
-    });
-    Ok(())
+        if mcp.level() == registration::Level::Warn {
+            println!("  to re-register this build:");
+            println!("    claude mcp remove diskscour && {}", mcp.add_command());
+        }
+    }
+    match mcp.sessions.len() {
+        0 => println!("  sessions    none connected"),
+        n => println!("  sessions    {n} connected · {}", mcp.sessions_by_client()),
+    }
 }
 
 // ---- trash ------------------------------------------------------------------

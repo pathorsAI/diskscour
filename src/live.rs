@@ -99,6 +99,37 @@ fn path_symlink_targets() -> Vec<PathBuf> {
     out
 }
 
+/// The executable behind a pid, straight from the kernel — unlike `ps`
+/// output, this survives paths with spaces (`~/Library/Application Support/…`).
+#[cfg(target_os = "macos")]
+pub fn exe_of_pid(pid: i32) -> Option<PathBuf> {
+    use std::os::raw::{c_int, c_void};
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4 * 1024;
+    unsafe extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    // SAFETY: writes at most `buffersize` bytes into a buffer we own.
+    let len = unsafe {
+        proc_pidpath(
+            pid,
+            buf.as_mut_ptr() as *mut c_void,
+            PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    if len <= 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..len as usize])
+        .ok()
+        .map(PathBuf::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn exe_of_pid(_pid: i32) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn running_executables() -> Vec<PathBuf> {
     use std::os::raw::{c_int, c_void};

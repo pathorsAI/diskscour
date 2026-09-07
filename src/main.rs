@@ -11,6 +11,7 @@ mod fsevents;
 mod index;
 mod live;
 mod mcp;
+mod registration;
 mod scan;
 mod treemap;
 mod util;
@@ -74,8 +75,11 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "DiskScour",
         native_options,
-        Box::new(|_cc| {
-            let mut app = DiskScourApp::default();
+        Box::new(|cc| {
+            let mut app = DiskScourApp {
+                mcp_rx: Some(spawn_mcp_watch(cc.egui_ctx.clone())),
+                ..Default::default()
+            };
             if let Some(home) = home_dir() {
                 app.root_input = home.display().to_string();
                 // Show the last scan of this folder immediately, if we have one,
@@ -174,12 +178,44 @@ struct DiskScourApp {
     /// the numbers are never presented without their provenance.
     scan_mode: Option<index::Mode>,
     scan_note: String,
+
+    /// Is the MCP server registered with an agent, and how many sessions are on
+    /// it. Refreshed by a background thread, since it reads the process table.
+    mcp: Option<registration::Status>,
+    mcp_rx: Option<Receiver<registration::Status>>,
+    mcp_open: bool,
+}
+
+/// How often the MCP status line re-reads the agent config and process table.
+const MCP_REFRESH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Poll registration state forever, waking the UI after each reading.
+fn spawn_mcp_watch(ctx: egui::Context) -> Receiver<registration::Status> {
+    let (tx, rx) = channel();
+    std::thread::Builder::new()
+        .name("mcp-status".into())
+        .spawn(move || {
+            loop {
+                if tx.send(registration::Status::collect()).is_err() {
+                    return; // the app is gone
+                }
+                ctx.request_repaint();
+                std::thread::sleep(MCP_REFRESH);
+            }
+        })
+        .expect("spawn mcp status thread");
+    rx
 }
 
 impl eframe::App for DiskScourApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_scan();
         self.poll_trash();
+        if let Some(rx) = &self.mcp_rx {
+            while let Ok(s) = rx.try_recv() {
+                self.mcp = Some(s);
+            }
+        }
         if self.scanning || self.trashing {
             ctx.request_repaint();
         }
@@ -195,6 +231,9 @@ impl eframe::App for DiskScourApp {
         egui::CentralPanel::default().show(ctx, |ui| self.ui_central(ui, tree.as_ref(), &actions));
         if self.pending.is_some() {
             self.ui_confirm(ctx, &actions);
+        }
+        if self.mcp_open {
+            self.ui_mcp(ctx);
         }
 
         self.tree = tree;
@@ -565,7 +604,9 @@ impl DiskScourApp {
                         util::human(avail),
                         util::human(total)
                     ));
+                    ui.separator();
                 }
+                self.ui_mcp_badge(ui);
             });
         });
 
@@ -602,6 +643,151 @@ impl DiskScourApp {
             });
         }
         ui.add_space(2.0);
+    }
+
+    // ---- MCP status ---------------------------------------------------------
+
+    /// The one-line badge in the status bar: a coloured dot and a headline.
+    /// Clicking opens the detail window.
+    fn ui_mcp_badge(&mut self, ui: &mut egui::Ui) {
+        let Some(st) = &self.mcp else {
+            ui.weak("MCP · checking…");
+            return;
+        };
+        let (dot, text) = match st.level() {
+            registration::Level::Ok => (
+                Color32::from_rgb(0x3d, 0x9a, 0x5c),
+                ui.visuals().text_color(),
+            ),
+            registration::Level::Warn => (
+                Color32::from_rgb(0xd4, 0x9a, 0x1e),
+                ui.visuals().text_color(),
+            ),
+            registration::Level::Off => (
+                ui.visuals().weak_text_color(),
+                ui.visuals().weak_text_color(),
+            ),
+        };
+        let headline = st.headline();
+        let r = ui
+            .horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let label = ui.add(
+                    egui::Label::new(RichText::new(&headline).color(text)).sense(Sense::click()),
+                );
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, dot);
+                label
+            })
+            .inner;
+        let tip = if st.registrations.is_empty() {
+            "DiskScour's MCP server is not registered with Claude Code. Click for the command."
+                .to_string()
+        } else {
+            let mut s = String::new();
+            for reg in &st.registrations {
+                s.push_str(&format!(
+                    "{} ({}): {} {}\n",
+                    reg.client,
+                    reg.scope,
+                    reg.command.display(),
+                    reg.args.join(" ")
+                ));
+            }
+            s.push_str(&match st.sessions.len() {
+                0 => "No agent session connected right now.".to_string(),
+                _ => format!("Connected: {}", st.sessions_by_client()),
+            });
+            s
+        };
+        if r.on_hover_text(tip).clicked() {
+            self.mcp_open = !self.mcp_open;
+        }
+    }
+
+    fn ui_mcp(&mut self, ctx: &egui::Context) {
+        let Some(st) = self.mcp.clone() else { return };
+        let mut open = self.mcp_open;
+        egui::Window::new("MCP server")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::RIGHT_BOTTOM, egui::vec2(-12.0, -40.0))
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "DiskScour speaks MCP over stdio: the agent launches `diskscour mcp` \
+                     as a child process and talks over pipes. There is no URL or port — \
+                     what matters is whether the agent is pointed at this build, and \
+                     how many sessions are talking to it.",
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("mcp-grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                    ui.weak("This build");
+                    ui.label(format!("v{}  {}", st.this_version, st.this_binary.display()));
+                    ui.end_row();
+
+                    ui.weak("Registered");
+                    if st.registrations.is_empty() {
+                        ui.label("no — Claude Code does not know about DiskScour yet");
+                    } else {
+                        ui.vertical(|ui| {
+                            for reg in &st.registrations {
+                                let ok = reg.health == registration::Health::Ok;
+                                ui.horizontal(|ui| {
+                                    ui.label(format!(
+                                        "{} · {} · {} {}",
+                                        reg.client,
+                                        reg.scope,
+                                        reg.command.display(),
+                                        reg.args.join(" ")
+                                    ));
+                                    let detail = reg.health.describe(st.this_version);
+                                    if ok {
+                                        ui.colored_label(Color32::from_rgb(0x3d, 0x9a, 0x5c), detail);
+                                    } else {
+                                        ui.colored_label(Color32::from_rgb(0xd4, 0x9a, 0x1e), detail);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    ui.end_row();
+
+                    ui.weak("Sessions");
+                    ui.label(match st.sessions.len() {
+                        0 => "none connected".to_string(),
+                        n => format!("{n} connected · {}", st.sessions_by_client()),
+                    });
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+
+                let cmd = st.add_command();
+                let heading = if st.registrations.is_empty() {
+                    "Register this build with Claude Code:"
+                } else if st.level() == registration::Level::Warn {
+                    "Point Claude Code at this build (remove the old entry first with `claude mcp remove diskscour`):"
+                } else {
+                    "To register this build elsewhere:"
+                };
+                ui.label(heading);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut cmd.clone())
+                            .font(FontId::monospace(12.0))
+                            .desired_width(460.0)
+                            .interactive(false),
+                    );
+                    if ui.button("Copy").clicked() {
+                        ui.ctx().copy_text(cmd.clone());
+                    }
+                });
+                ui.add_space(4.0);
+                ui.weak("Tools: ds_status, ds_scan, ds_caches, ds_top, ds_tree, ds_trash. \
+                         `diskscour status` prints the same information.");
+            });
+        self.mcp_open = open;
     }
 
     fn ui_central(
