@@ -172,6 +172,38 @@ mod imp {
         unsafe { FSEventsGetCurrentEventId() }
     }
 
+    /// "History done" means fseventsd has replayed what it had already
+    /// processed — not what was still in flight from the kernel when the
+    /// stream was created. A change made a moment before this call can
+    /// therefore be missing, which shows up as "0 directories changed" after
+    /// a real edit. The stream stays live after the marker, so ask fseventsd
+    /// to push out everything it holds, then keep listening until the stream
+    /// has been quiet for SETTLE_SECS — a burst still landing keeps us
+    /// listening, bounded by SETTLE_MAX_SECS so a busy volume can't hold a
+    /// scan hostage. Cheap next to a walk.
+    ///
+    /// SAFETY: `stream` must be started and scheduled on this thread's run
+    /// loop, and `state` must be the `Collect` its callback writes to. The
+    /// callback only runs inside CFRunLoopRunInMode, so reading `state`
+    /// between slices does not race.
+    unsafe fn settle(stream: FSEventStreamRef, state: &Collect) {
+        unsafe {
+            FSEventStreamFlushSync(stream);
+            let mut quiet = 0.0f64;
+            let mut total = 0.0f64;
+            while quiet < SETTLE_SECS && total < SETTLE_MAX_SECS {
+                let seen = state.paths.len();
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, SETTLE_SLICE_SECS, 0);
+                total += SETTLE_SLICE_SECS;
+                quiet = if state.paths.len() > seen {
+                    0.0
+                } else {
+                    quiet + SETTLE_SLICE_SECS
+                };
+            }
+        }
+    }
+
     pub fn changed_since(root: &Path, since: u64) -> Replay {
         if since == 0 {
             return Replay::Unavailable("no recorded stream position");
@@ -251,30 +283,8 @@ mod imp {
                 waited += 0.25;
             }
 
-            // "History done" means fseventsd has replayed what it had already
-            // processed — not what was still in flight from the kernel when the
-            // stream was created. A change made a moment before this call can
-            // therefore be missing, which shows up as "0 directories changed"
-            // after a real edit. The stream stays live after the marker, so ask
-            // fseventsd to push out everything it holds, then keep listening for
-            // a short grace period to catch the rest. Cheap next to a walk.
-            // The wait ends after SETTLE_SECS of silence rather than a fixed
-            // interval, so a burst still landing keeps us listening, bounded
-            // by SETTLE_MAX_SECS so a busy volume can't hold a scan hostage.
             if state.history_done {
-                FSEventStreamFlushSync(stream);
-                let mut quiet = 0.0f64;
-                let mut total = 0.0f64;
-                while quiet < SETTLE_SECS && total < SETTLE_MAX_SECS {
-                    let seen = state.paths.len();
-                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, SETTLE_SLICE_SECS, 0);
-                    total += SETTLE_SLICE_SECS;
-                    quiet = if state.paths.len() > seen {
-                        0.0
-                    } else {
-                        quiet + SETTLE_SLICE_SECS
-                    };
-                }
+                settle(stream, &state);
             }
 
             FSEventStreamStop(stream);
