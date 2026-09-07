@@ -259,6 +259,13 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// The kernel folds back-to-back events on one directory into a single
+    /// record, so a rescan a millisecond after a write can legitimately see
+    /// nothing new. No one rescans that fast; give the event its own moment.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
     #[test]
     fn incremental_picks_up_a_new_file() {
         let base = tmp("newfile");
@@ -271,6 +278,7 @@ mod tests {
         let before = first.tree.nodes[first.tree.root].size;
 
         fs::write(base.join("proj/target/debug/extra"), vec![0u8; 80_000]).unwrap();
+        settle();
 
         let after = refresh(
             base.clone(),
@@ -300,6 +308,7 @@ mod tests {
         let before = first.tree.nodes[first.tree.root].size;
 
         fs::remove_dir_all(base.join("proj/target")).unwrap();
+        settle();
 
         let after = refresh(
             base.clone(),
