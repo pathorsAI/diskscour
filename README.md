@@ -85,6 +85,12 @@ actually moved.
   rescan        0.66s   events · 4 directories changed
 ```
 
+A rescan also waits for the event stream to go quiet for a moment before
+trusting it: fseventsd reports "history done" for what it has already
+processed, and a change made a moment earlier can still be on its way. Without
+that pause, deleting a folder and rescanning at once could report nothing
+changed.
+
 Two things keep that honest. Any doubt about the event history — dropped events,
 a purged log, a network volume, a root reached through a symlink — falls back to
 a slower strategy rather than pruning on a guess. And every result says which

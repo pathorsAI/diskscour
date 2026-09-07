@@ -27,10 +27,17 @@ pub enum Replay {
 /// Reaching it means the log is unexpectedly large or slow; falling back costs
 /// a slower scan, whereas waiting forever would hang the app.
 const REPLAY_TIMEOUT_SECS: f64 = 10.0;
+/// After the history marker, keep listening until the stream has been quiet
+/// for this long — events still on their way to fseventsd when the replay was
+/// requested arrive live, a little after the marker.
+const SETTLE_SECS: f64 = 0.2;
+const SETTLE_SLICE_SECS: f64 = 0.05;
+/// Upper bound on the settle wait, however busy the volume is.
+const SETTLE_MAX_SECS: f64 = 2.0;
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{REPLAY_TIMEOUT_SECS, Replay};
+    use super::{REPLAY_TIMEOUT_SECS, Replay, SETTLE_MAX_SECS, SETTLE_SECS, SETTLE_SLICE_SECS};
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_uint, c_void};
     use std::path::{Path, PathBuf};
@@ -113,6 +120,7 @@ mod imp {
         );
         fn FSEventStreamStart(stream: FSEventStreamRef) -> Boolean;
         fn FSEventStreamStop(stream: FSEventStreamRef);
+        fn FSEventStreamFlushSync(stream: FSEventStreamRef);
         fn FSEventStreamInvalidate(stream: FSEventStreamRef);
         fn FSEventStreamRelease(stream: FSEventStreamRef);
         fn FSEventsGetCurrentEventId() -> FSEventStreamEventId;
@@ -241,6 +249,32 @@ mod imp {
             while !state.history_done && waited < REPLAY_TIMEOUT_SECS {
                 CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.25, 1);
                 waited += 0.25;
+            }
+
+            // "History done" means fseventsd has replayed what it had already
+            // processed — not what was still in flight from the kernel when the
+            // stream was created. A change made a moment before this call can
+            // therefore be missing, which shows up as "0 directories changed"
+            // after a real edit. The stream stays live after the marker, so ask
+            // fseventsd to push out everything it holds, then keep listening for
+            // a short grace period to catch the rest. Cheap next to a walk.
+            // The wait ends after SETTLE_SECS of silence rather than a fixed
+            // interval, so a burst still landing keeps us listening, bounded
+            // by SETTLE_MAX_SECS so a busy volume can't hold a scan hostage.
+            if state.history_done {
+                FSEventStreamFlushSync(stream);
+                let mut quiet = 0.0f64;
+                let mut total = 0.0f64;
+                while quiet < SETTLE_SECS && total < SETTLE_MAX_SECS {
+                    let seen = state.paths.len();
+                    CFRunLoopRunInMode(kCFRunLoopDefaultMode, SETTLE_SLICE_SECS, 0);
+                    total += SETTLE_SLICE_SECS;
+                    quiet = if state.paths.len() > seen {
+                        0.0
+                    } else {
+                        quiet + SETTLE_SLICE_SECS
+                    };
+                }
             }
 
             FSEventStreamStop(stream);
