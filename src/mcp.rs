@@ -360,13 +360,18 @@ fn tool_status() -> Result<Value, String> {
         })
         .collect();
 
+    // How this server is wired in. `sessions` counts this process too, so a
+    // lone caller sees 1 rather than 0.
+    let mcp = crate::registration::Status::collect().to_json();
+
     if roots.is_empty() {
         return Ok(json!({
             "indexed_roots": [],
             "hint": "Nothing indexed yet. Call ds_scan with a path such as the user's home or project folder.",
+            "mcp": mcp,
         }));
     }
-    Ok(json!({"indexed_roots": roots}))
+    Ok(json!({"indexed_roots": roots, "mcp": mcp}))
 }
 
 fn tool_scan(args: &Value) -> Result<Value, String> {
