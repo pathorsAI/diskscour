@@ -160,6 +160,17 @@ That adds six tools: `ds_status`, `ds_scan`, `ds_caches`, `ds_top`, `ds_tree`
 and `ds_trash`. Reads are served from the index rather than by scanning, so
 asking is cheap.
 
+Scanning `/` works. A whole-disk scan takes minutes, longer than an MCP client
+waits for a tool call, so `ds_scan` runs it in the background and answers
+`status: running` with the files and bytes so far; calling `ds_scan` again with
+the same path waits for the same scan rather than starting another. Once it is
+done, every read is served from the index like any other folder.
+
+Folders the process is not allowed to read are counted and reported as
+`unreadable_dirs`. On macOS that number is almost always Full Disk Access: grant
+it to the terminal, or to the app that launched `diskscour mcp`, under System
+Settings → Privacy & Security, then scan again.
+
 The server speaks MCP over **stdio** — the agent launches `diskscour mcp` as a
 child process — so there is no URL or port. What there is to know is whether
 the agent is pointed at the build you're running, and how many sessions are on
