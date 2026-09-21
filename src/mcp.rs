@@ -20,6 +20,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
 
@@ -27,7 +28,7 @@ use crate::caches;
 use crate::cleanup;
 use crate::engine::{self, Freshness};
 use crate::index::Index;
-use crate::scan::ScanProgress;
+use crate::scan::{FULL_DISK_ACCESS_HINT, ScanProgress};
 use crate::util;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -385,12 +386,9 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         _ => Freshness::Auto,
     };
 
-    let result = engine::refresh(
-        root.clone(),
-        freshness,
-        Arc::new(ScanProgress::default()),
-        |_| {},
-    );
+    let progress = Arc::new(ScanProgress::default());
+    let result = engine::refresh(root.clone(), freshness, progress.clone(), |_| {});
+    let unreadable = progress.unreadable.load(Ordering::Relaxed);
     let hits = caches::detect_in_index(&result.index);
     let refs = crate::live::Refs::collect();
     let reclaimable: u64 = hits
@@ -399,7 +397,7 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         .map(|h| h.private)
         .sum();
 
-    Ok(json!({
+    let mut v = json!({
         "root": root.to_string_lossy(),
         "total_bytes": result.index.total_bytes(),
         "total_human": util::human(result.index.total_bytes()),
@@ -411,8 +409,13 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         "mode": result.mode.as_str(),
         "why": result.reason,
         "changed_dirs": result.changed_dirs,
+        "unreadable_dirs": unreadable,
         "index_saved": result.saved,
-    }))
+    });
+    if unreadable > 0 && root == Path::new("/") {
+        v["hint"] = json!(FULL_DISK_ACCESS_HINT);
+    }
+    Ok(v)
 }
 
 /// Match a user-supplied ecosystem filter against a category label.

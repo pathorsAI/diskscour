@@ -26,7 +26,28 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(400);
 pub struct ScanProgress {
     pub files: AtomicU64,
     pub bytes: AtomicU64,
+    /// Directories the walk could not read. Sizes below them are missing from
+    /// the totals; on macOS the usual cause is a missing Full Disk Access grant.
+    pub unreadable: AtomicU64,
     pub done: AtomicBool,
+}
+
+/// What to tell a user whose whole-disk scan hit unreadable directories.
+pub const FULL_DISK_ACCESS_HINT: &str = "Unreadable folders usually mean Full Disk Access is \
+    missing. Grant it to the terminal or the app that launched DiskScour (System Settings \
+    → Privacy & Security → Full Disk Access) and scan again.";
+
+/// Directories a walk never descends into, matched by exact path. On macOS the
+/// Data volume is mounted at /System/Volumes/Data and reached from / through
+/// firmlinks (/Users, /private, …); walking both counts everything twice.
+/// /Volumes holds other disks and Time Machine mounts; /dev is not storage.
+#[cfg(target_os = "macos")]
+const NEVER_DESCEND: &[&str] = &["/System/Volumes", "/Volumes", "/dev"];
+#[cfg(not(target_os = "macos"))]
+const NEVER_DESCEND: &[&str] = &[];
+
+fn never_descend(path: &Path) -> bool {
+    NEVER_DESCEND.iter().any(|p| Path::new(p) == path)
 }
 
 /// One node in the size tree (file or directory).
@@ -334,7 +355,7 @@ fn scan_impl(
     let walk = WalkDirGeneric::<((), EntryState)>::new(&root)
         .skip_hidden(false)
         .follow_links(false)
-        .process_read_dir(move |_depth, path, _state, children| {
+        .process_read_dir(move |depth, path, _state, children| {
             // A directory's own mtime was recorded when its parent was read, so
             // there is no stat here; only the scan root has to be asked directly.
             let mtime = di
@@ -368,6 +389,16 @@ fn scan_impl(
             if files_cached {
                 // Their sizes are served from the index; don't walk or stat them.
                 children.retain(|e| e.as_ref().map(|e| e.file_type.is_dir()).unwrap_or(false));
+            }
+            // jwalk calls this once for the root's parent with `depth == None`
+            // and the root as the only child; filtering there would drop the
+            // root itself and make `scan /Volumes` return an empty tree.
+            if depth.is_some() {
+                children.retain(|e| {
+                    e.as_ref()
+                        .map(|e| !(e.file_type.is_dir() && never_descend(&e.path())))
+                        .unwrap_or(true)
+                });
             }
 
             // One `getattrlistbulk` call yields every child's size, replacing a
@@ -451,8 +482,14 @@ fn scan_impl(
     for entry in walk {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(_) => {
+                progress.unreadable.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
         };
+        if entry.read_children_error.is_some() {
+            progress.unreadable.fetch_add(1, Ordering::Relaxed);
+        }
         let path = entry.path();
         let idx = get_or_create(&mut nodes, &mut index, &path);
         let is_dir = entry.file_type.is_dir();
@@ -732,5 +769,15 @@ mod tests {
         assert_eq!(a.nodes[a.root].size, b.nodes[b.root].size);
         assert_eq!(a.nodes[a.root].file_count, b.nodes[b.root].file_count);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn never_descend_matches_exact_paths_only() {
+        assert!(never_descend(Path::new("/System/Volumes")));
+        assert!(!never_descend(Path::new("/System/Volumes/Data")));
+        assert!(!never_descend(Path::new("/Volumes/External")));
+        assert!(never_descend(Path::new("/dev")));
+        assert!(!never_descend(Path::new("/")));
     }
 }
