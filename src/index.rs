@@ -116,8 +116,15 @@ pub fn now_secs() -> u64 {
 ///
 /// `Caches/` is the honest home for this: the index is regenerable, and the
 /// worst consequence of the system purging it is one slower scan.
+///
+/// `DISKSCOUR_CACHE_DIR` overrides it. The integration tests run the real
+/// binary and would otherwise leave indexes of vanished temp trees in the
+/// user's cache.
 #[cfg(not(test))]
 pub fn cache_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DISKSCOUR_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
