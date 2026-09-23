@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DiskScour</title>
+<meta name="description" content="A fast, native macOS disk analyzer. It finds regenerable build caches across all your projects and moves them to the Trash in one click.">
+<link rel="icon" href="assets/icon.png">
+<meta property="og:title" content="DiskScour">
+<meta property="og:description" content="A fast, native macOS disk analyzer. It finds regenerable build caches across all your projects and moves them to the Trash in one click.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://pathorsai.github.io/diskscour/">
+<meta property="og:image" content="https://pathorsai.github.io/diskscour/assets/demo-caches.png">
+<style>
+:root {
+  --paper: #F6F6F8;
+  --ink: #141620;
+  --muted: #5F6472;
+  --line: #D9DBE3;
+  --track: #C8CBD6;
+  --amber: #FBBF24;
+  --blue: #2563EB;
+  --term: #1C1D22;
+  --term-ink: #E6E7EC;
+  --term-muted: #8A8F9C;
+  --code-bg: #E9EAF0;
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #17181D;
+    --ink: #ECEDF2;
+    --muted: #9A9FAD;
+    --line: #2C2E36;
+    --track: #3A3D48;
+    --amber: #FBBF24;
+    --blue: #3B82F6;
+    --term: #0F1013;
+    --term-ink: #E6E7EC;
+    --term-muted: #7E8391;
+    --code-bg: #23252C;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1040px;
+  margin-inline: auto;
+  padding-inline: clamp(16px, 4vw, 40px);
+}
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+img { max-width: 100%; height: auto; display: block; }
+p { margin: 0 0 1rem; max-width: 68ch; }
+h1, h2, h3 { margin: 0; }
+h1 {
+  font-size: clamp(2.4rem, 6vw, 4rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.02;
+  max-width: 18ch;
+}
+h2 {
+  font-size: 1.75rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  margin-bottom: 1.25rem;
+}
+h3 {
+  font-size: 1.125rem;
+  font-weight: 650;
+  margin: 2rem 0 0.75rem;
+}
+small, .meta, figcaption { font-size: 0.875rem; color: var(--muted); }
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  overflow-wrap: anywhere;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+header.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-block: 1.25rem;
+}
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--ink);
+  font-weight: 650;
+  font-size: 1.125rem;
+}
+.brand img { width: 40px; height: 40px; }
+.brand:hover { text-decoration: none; }
+
+.hero { padding-block: clamp(3rem, 8vw, 6rem) clamp(4rem, 8vw, 6rem); }
+.pitch { font-size: 1.25rem; line-height: 1.5; margin: 1.5rem 0 2rem; max-width: 52ch; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1rem; }
+.btn {
+  display: inline-block;
+  padding: 0.7rem 1.2rem;
+  border-radius: 7px;
+  font-weight: 600;
+  font-size: 1rem;
+  line-height: 1.2;
+  border: 1px solid transparent;
+}
+.btn:hover { text-decoration: none; }
+.btn.primary { background: var(--blue); color: #FFFFFF; border-color: var(--blue); }
+.btn.secondary { color: var(--ink); border-color: var(--track); }
+.btn.secondary:hover { border-color: var(--muted); }
+
+section {
+  border-top: 1px solid var(--line);
+  padding-block: clamp(4rem, 8vw, 6rem);
+}
+section > p:last-child { margin-bottom: 0; }
+
+figure { margin: 2rem 0; }
+figure.shot img {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #1E1F23;
+}
+figcaption { margin-top: 0.75rem; max-width: 68ch; }
+
+.bars { margin: 1.75rem 0; max-width: 68ch; }
+.bar { display: block; margin-bottom: 1rem; }
+.bar:last-child { margin-bottom: 0; }
+.bar .row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  margin-bottom: 0.4rem;
+  font-size: 0.9375rem;
+}
+.bar .name { flex: 1; }
+.bar .num, .num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9rem;
+}
+.bar .note { color: var(--muted); }
+.bar .rail {
+  height: 14px;
+  border-radius: 7px;
+  background: var(--line);
+  overflow: hidden;
+}
+.bar .rail.disk { background: var(--track); }
+.bar .fill {
+  height: 100%;
+  width: var(--w);
+  min-width: 4px;
+  border-radius: 7px;
+  background: var(--track);
+}
+.bar .fill.amber { background: var(--amber); }
+
+.grid {
+  display: grid;
+  gap: 3rem clamp(2rem, 5vw, 4rem);
+}
+@media (min-width: 760px) {
+  .grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+}
+.grid > div { min-width: 0; }
+.grid h3 { margin-top: 0; font-size: 1.25rem; }
+.grid .bars, .grid .term { margin-block: 1.25rem; }
+
+.term {
+  background: var(--term);
+  color: var(--term-ink);
+  border-radius: 8px;
+  padding: 1rem 1.15rem;
+  margin: 1.5rem 0;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  line-height: 1.55;
+  overflow-x: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+.term pre { margin: 0; font: inherit; white-space: pre; }
+.term .p { color: var(--term-muted); }
+.term .c { color: var(--term-muted); }
+.term.copyable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.term.copyable pre { overflow-x: auto; flex: 1; min-width: 0; }
+.copy {
+  flex: none;
+  font: inherit;
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: var(--term-ink);
+  background: transparent;
+  border: 1px solid var(--term-muted);
+  border-radius: 6px;
+  padding: 0.35rem 0.75rem;
+  cursor: pointer;
+  min-width: 5rem;
+}
+.copy:hover { border-color: var(--term-ink); }
+.copy:focus-visible { outline-color: var(--amber); }
+
+ul, ol { padding-left: 1.4rem; margin: 0 0 1rem; max-width: 68ch; }
+li { margin-bottom: 0.4rem; }
+ol.steps li { margin-bottom: 0.75rem; }
+
+footer {
+  border-top: 1px solid var(--line);
+  padding-block: 2rem 3rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  justify-content: space-between;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <a class="brand" href="https://pathorsai.github.io/diskscour/">
+    <img src="assets/logo.svg" width="40" height="40" alt="">
+    DiskScour
+  </a>
+  <a href="https://github.com/pathorsAI/diskscour">GitHub</a>
+</header>
+
+<main>
+
+<div class="hero">
+  <h1>Find the gigabytes of build junk on your dev machine.</h1>
+  <p class="pitch">A fast, native macOS disk analyzer. It finds regenerable build caches across all your projects and moves them to the Trash in one click.</p>
+  <div class="actions">
+    <a class="btn primary" href="https://github.com/pathorsAI/diskscour/releases/latest">Download for macOS</a>
+    <a class="btn secondary" href="https://github.com/pathorsAI/diskscour">View on GitHub</a>
+  </div>
+  <p class="meta">Universal build, Apple Silicon and Intel. MIT licensed.</p>
+</div>
+
+<section id="problem">
+  <h2>Where the disk went</h2>
+  <p>Your disk fills up and you have no idea where it went. On a dev machine the answer is almost always regenerable build caches: <code>node_modules</code>, Rust <code>target/</code>, <code>.next</code>, <code>DerivedData</code>, <code>.gradle</code>, scattered across dozens of projects and git worktrees.</p>
+  <p>They add up to tens of gigabytes you can delete and recreate any time. Finder won't show you that, and <code>du</code> won't tell you which ones are safe to delete.</p>
+
+  <div class="bars">
+    <div class="bar">
+      <div class="row"><span class="name"><span class="num">59.8 GB</span> of <span class="num">62.3 GB</span> is build caches</span></div>
+      <div class="rail disk"><div class="fill amber" style="--w: 96%"></div></div>
+    </div>
+  </div>
+
+  <figure class="shot">
+    <img src="assets/demo-caches.png" width="1770" height="1086" loading="lazy" alt="The DiskScour window on the Dev caches tab, listing Rust target and node_modules folders grouped by ecosystem with a reclaimable total and a Move to Trash button">
+    <figcaption>Point it at a folder. Build caches are grouped by ecosystem, safe to delete, with one number for what they add up to.</figcaption>
+  </figure>
+
+  <p>Caches are matched in context, so a <code>target/</code> only counts next to a <code>Cargo.toml</code>, and nested caches are de-duplicated.</p>
+</section>
+
+<section id="browse">
+  <h2>Tree and treemap</h2>
+  <p>Browse what's actually there as a tree sorted biggest-first, or as a treemap. Click to drill in, hover for details.</p>
+  <figure class="shot">
+    <img src="assets/demo-treemap.png" width="1770" height="1086" loading="lazy" alt="The DiskScour window on the Treemap tab, showing project folders as coloured rectangles sized by how much disk they use">
+  </figure>
+</section>
+
+<section id="trust">
+  <h2>What makes the number trustworthy</h2>
+  <div class="grid">
+
+    <div>
+      <h3>Scan once, query often</h3>
+      <p>The first scan of a folder is a full walk. After that DiskScour keeps a small index in <code>~/Library/Caches/com.pathors.diskscour/</code> and asks the macOS FSEvents log what changed since, so a rescan only walks the directories that moved.</p>
+      <div class="bars">
+        <div class="bar">
+          <div class="row"><span class="name">first scan</span><span class="num">67.51s</span><span class="note">full</span></div>
+          <div class="rail"><div class="fill" style="--w: 100%"></div></div>
+        </div>
+        <div class="bar">
+          <div class="row"><span class="name">rescan</span><span class="num">0.66s</span><span class="note">events, 4 directories changed</span></div>
+          <div class="rail"><div class="fill amber" style="--w: 1%"></div></div>
+        </div>
+      </div>
+      <p>Any doubt about the event history falls back to a slower strategy, and every result says which strategy produced it. <code>--full</code> forces a full scan, and an index older than a week does one on its own.</p>
+    </div>
+
+    <div>
+      <h3>The reclaimable number means what it says</h3>
+      <p>On APFS a block can belong to several files at once. <code>clonefile(2)</code>, which <code>bun install</code> and <code>cp -c</code> use, shares blocks between copies, and <code>du</code> counts those blocks once per file. DiskScour reads the private size instead, <code>ATTR_CMNEXT_PRIVATESIZE</code> via <code>getattrlistbulk(2)</code>: the bytes deleting the file would actually free.</p>
+      <div class="bars">
+        <div class="bar">
+          <div class="row"><span class="name">apparent (what <code>du</code> reports)</span><span class="num">76.4 GB</span></div>
+          <div class="rail"><div class="fill" style="--w: 100%"></div></div>
+        </div>
+        <div class="bar">
+          <div class="row"><span class="name">actually reclaimable</span><span class="num">20.7 GB</span></div>
+          <div class="rail"><div class="fill amber" style="--w: 27.1%"></div></div>
+        </div>
+      </div>
+      <p>Both numbers are shown, and anything whose apparent size is mostly shared says so.</p>
+    </div>
+
+    <div>
+      <h3>It won't delete a tool you're using</h3>
+      <p>A <code>target/</code> directory is regenerable, unless a binary in <code>target/release/</code> is reached from a symlink on <code>$PATH</code> or from a running process. DiskScour refuses those and says why.</p>
+      <div class="term"><pre>skipped  …/patchbay/target  (in use: …/target/release/patchbay-mcp
+                             (a process is running from it) and 1 other executable(s))</pre></div>
+      <p><code>--allow-any</code> does not lift it. This is a guard against the common cases, not a proof of safety.</p>
+    </div>
+
+    <div>
+      <h3>Everything is Trash, never a hard delete</h3>
+      <p>Selected items go to the macOS Trash, recoverable, always behind a confirmation. There is no hard-delete path. Every target is re-checked against the filesystem at the moment of deletion, so a stale index can't cause the wrong thing to go.</p>
+    </div>
+
+  </div>
+</section>
+
+<section id="terminal">
+  <h2>From the terminal</h2>
+  <p>No window, just the numbers. <code>--json</code> works on <code>scan</code>, <code>caches</code>, <code>status</code> and <code>trash</code>.</p>
+  <div class="term"><pre><span class="p">$ </span>diskscour scan ~/Github
+<span class="p">$ </span>diskscour caches ~/Github --json --min 1000000000   <span class="c"># every cache over 1 GB</span>
+<span class="p">$ </span>diskscour status                                    <span class="c"># what's already indexed</span>
+<span class="p">$ </span>diskscour trash ~/Github/some/target                <span class="c"># previews; add --yes to do it</span></pre></div>
+  <div class="term"><pre>~/Github, 140.9 GB across 5.1M files
+
+  first scan   67.51s   full
+  rescan        0.66s   events · 4 directories changed</pre></div>
+  <p><code>diskscour --help</code> lists the lot.</p>
+</section>
+
+<section id="mcp">
+  <h2>Use it from Claude Code</h2>
+  <p>DiskScour speaks MCP over stdio, so a coding agent can read the scan results and clean up without parsing text.</p>
+  <div class="term copyable">
+    <pre><span class="p">$ </span>claude mcp add diskscour -- /usr/local/bin/diskscour mcp</pre>
+    <button class="copy" type="button" data-cmd="claude mcp add diskscour -- /usr/local/bin/diskscour mcp" aria-live="polite">Copy</button>
+  </div>
+  <p>That adds six tools: <code>ds_status</code>, <code>ds_scan</code>, <code>ds_caches</code>, <code>ds_top</code>, <code>ds_tree</code> and <code>ds_trash</code>. Reads are served from the index rather than by scanning, so asking is cheap. A whole-disk scan of <code>/</code> runs in the background, and <code>ds_scan</code> reports progress until it is done.</p>
+  <ul>
+    <li><code>ds_trash</code> previews by default and deletes nothing without <code>confirm: true</code>.</li>
+    <li>Only recognised regenerable caches are accepted. Anything else needs <code>allow_any</code>.</li>
+    <li>Targets must sit inside an indexed root.</li>
+    <li>Every target is re-checked against the filesystem at the moment of deletion.</li>
+    <li>Deletion always means the macOS Trash.</li>
+  </ul>
+  <h3>Claude Desktop</h3>
+  <p>Add the same server to <code>claude_desktop_config.json</code>.</p>
+  <div class="term"><pre>{
+  "mcpServers": {
+    "diskscour": {
+      "command": "/usr/local/bin/diskscour",
+      "args": ["mcp"]
+    }
+  }
+}</pre></div>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+  <ol class="steps">
+    <li>Download the zip from <a href="https://github.com/pathorsAI/diskscour/releases/latest">Releases</a> and unzip it.</li>
+    <li>Move DiskScour.app to /Applications.</li>
+    <li>First launch: right-click the app and choose Open, or run <code>xattr -dr com.apple.quarantine /Applications/DiskScour.app</code>.</li>
+  </ol>
+  <p>Or build from source:</p>
+  <div class="term"><pre><span class="p">$ </span>cargo install --git https://github.com/pathorsAI/diskscour</pre></div>
+</section>
+
+</main>
+
+<footer>
+  <span>MIT © Pathors</span>
+  <a href="https://github.com/pathorsAI/diskscour">GitHub</a>
+</footer>
+
+</div>
+<script>
+document.querySelector('.copy').addEventListener('click', async function () {
+  const copied = await navigator.clipboard.writeText(this.dataset.cmd).then(() => true, () => false);
+  this.textContent = copied ? 'Copied' : 'Press \u2318C';
+  setTimeout(() => { this.textContent = 'Copy'; }, 2000);
+});
+</script>
+</body>
+</html>

@@ -6,6 +6,8 @@
 
 <p align="center">A fast, native macOS disk analyzer that finds — and reclaims — the gigabytes of build junk on your dev machine.</p>
 
+<p align="center"><a href="https://pathorsai.github.io/diskscour/">pathorsai.github.io/diskscour</a></p>
+
 ---
 
 ## The problem
