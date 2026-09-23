@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use jwalk::WalkDirGeneric;
+
 use crate::bulkstat;
 use crate::index::Index;
 
@@ -308,6 +310,284 @@ fn dir_mtime_ns(path: &Path) -> i64 {
     }
 }
 
+type WalkState = ((), EntryState);
+type WalkEntry = jwalk::DirEntry<WalkState>;
+
+struct FileFacts {
+    allocated: u64,
+    private: u64,
+    fileid: u64,
+    nlink: u32,
+}
+
+type BulkSizes = HashMap<String, FileFacts>;
+
+struct DirReader {
+    /// Facts about each directory, filled in on the walk threads and read back
+    /// when the corresponding node is built. One lock per directory, not per file.
+    dir_info: Arc<Mutex<HashMap<PathBuf, DirInfo>>>,
+    hardlinks: Arc<Mutex<HashSet<(u64, u64)>>>,
+    progress: Arc<ScanProgress>,
+    prior_paths: Arc<HashMap<PathBuf, u32>>,
+    prior_mtimes: Arc<Vec<i64>>,
+    dirty: Option<Arc<HashSet<PathBuf>>>,
+    /// One device id for the whole walk. Hardlink identity is (device, inode),
+    /// and a `stat` per directory just to re-learn the same number is waste.
+    root_dev: u64,
+}
+
+impl DirReader {
+    fn new(root: &Path, reuse: Option<&Reuse<'_>>, progress: Arc<ScanProgress>) -> Self {
+        Self {
+            dir_info: Arc::new(Mutex::new(HashMap::new())),
+            hardlinks: Arc::new(Mutex::new(HashSet::new())),
+            progress,
+            prior_paths: Arc::new(reuse.map(|r| r.prior.by_path()).unwrap_or_default()),
+            prior_mtimes: Arc::new(
+                reuse
+                    .map(|r| r.prior.dirs.iter().map(|d| d.mtime_ns).collect())
+                    .unwrap_or_default(),
+            ),
+            dirty: reuse
+                .and_then(|r| r.dirty_closure)
+                .map(|d| Arc::new(d.clone())),
+            root_dev: device_of(root),
+        }
+    }
+
+    fn read_dir(
+        &self,
+        depth: Option<usize>,
+        path: &Path,
+        children: &mut Vec<jwalk::Result<WalkEntry>>,
+    ) {
+        let info = self.dir_facts(path);
+        if info.files_cached {
+            // Their sizes are served from the index; don't walk or stat them.
+            children.retain(|e| e.as_ref().map(|e| e.file_type.is_dir()).unwrap_or(false));
+        }
+        // jwalk calls this once for the root's parent with `depth == None`
+        // and the root as the only child; filtering there would drop the
+        // root itself and make `scan /Volumes` return an empty tree.
+        if depth.is_some() {
+            children.retain(|e| {
+                e.as_ref()
+                    .map(|e| !(e.file_type.is_dir() && never_descend(&e.path())))
+                    .unwrap_or(true)
+            });
+        }
+
+        let bulk = self.bulk_sizes(path, info.files_cached);
+        for entry in children.iter_mut().flatten() {
+            if entry.file_type.is_dir() {
+                self.mark_reused(entry);
+            } else if entry.file_type.is_file() {
+                self.size_file(entry, bulk.as_ref());
+            }
+        }
+    }
+
+    fn dir_facts(&self, path: &Path) -> DirInfo {
+        // A directory's own mtime was recorded when its parent was read, so
+        // there is no stat here; only the scan root has to be asked directly.
+        let recorded = self
+            .dir_info
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|d: &DirInfo| d.mtime_ns)
+            .unwrap_or(0);
+        let mtime_ns = if recorded == 0 {
+            dir_mtime_ns(path)
+        } else {
+            recorded
+        };
+        // Same directory, same mtime → its direct entries are unchanged, so
+        // the sizes of its own files can come from the index.
+        let files_cached = mtime_ns != 0
+            && self
+                .prior_paths
+                .get(path)
+                .and_then(|&ix| self.prior_mtimes.get(ix as usize).copied())
+                .is_some_and(|m| m == mtime_ns);
+
+        let info = DirInfo {
+            mtime_ns,
+            files_cached,
+        };
+        self.dir_info
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), info);
+        info
+    }
+
+    /// One `getattrlistbulk` call yields every child's size, replacing a stat
+    /// per file — and it is the only source of the private-byte figure. Returns
+    /// `None` where it is unavailable, leaving callers on per-file stat.
+    fn bulk_sizes(&self, path: &Path, files_cached: bool) -> Option<BulkSizes> {
+        if files_cached {
+            return None;
+        }
+        let entries = bulkstat::read_dir(path)?;
+        let mut files = BulkSizes::new();
+        let mut info = self.dir_info.lock().unwrap();
+        for e in entries {
+            if e.is_file {
+                files.insert(
+                    e.name,
+                    FileFacts {
+                        allocated: e.allocated,
+                        private: e.private,
+                        fileid: e.fileid,
+                        nlink: e.nlink,
+                    },
+                );
+            } else if e.mtime_ns != 0 {
+                // Hand each child directory its mtime now, so the pass that
+                // reads it does not need a stat of its own.
+                info.entry(path.join(&e.name)).or_insert(DirInfo {
+                    mtime_ns: e.mtime_ns,
+                    files_cached: false,
+                });
+            }
+        }
+        Some(files)
+    }
+
+    /// A directory with no changed path at or below it can be served whole from
+    /// the index — don't descend.
+    fn mark_reused(&self, entry: &mut WalkEntry) {
+        let Some(dirty) = &self.dirty else {
+            return;
+        };
+        let path = entry.path();
+        if !dirty.contains(&path)
+            && let Some(&ix) = self.prior_paths.get(&path)
+        {
+            entry.client_state.reused = Some(ix);
+            entry.read_children_path = None;
+        }
+    }
+
+    fn size_file(&self, entry: &mut WalkEntry, bulk: Option<&BulkSizes>) {
+        let name = entry.file_name.to_string_lossy();
+        let sized = match bulk.and_then(|m| m.get(name.as_ref())) {
+            Some(f) => Some(dedup_hardlink(
+                f.allocated,
+                f.private,
+                self.root_dev,
+                f.fileid,
+                f.nlink,
+                &self.hardlinks,
+            )),
+            None => std::fs::symlink_metadata(entry.path())
+                .ok()
+                .map(|md| counted_size(&md, &self.hardlinks)),
+        };
+        if let Some((sz, priv_sz)) = sized {
+            entry.client_state.size = sz;
+            entry.client_state.private = priv_sz;
+            self.progress.files.fetch_add(1, Ordering::Relaxed);
+            self.progress.bytes.fetch_add(sz, Ordering::Relaxed);
+        }
+    }
+}
+
+struct CachedTree<'a> {
+    prior: &'a Index,
+    paths: Arc<HashMap<PathBuf, u32>>,
+    kids: Vec<Vec<u32>>,
+}
+
+impl CachedTree<'_> {
+    fn attach(
+        &self,
+        nodes: &mut Vec<Node>,
+        idx: usize,
+        path: &Path,
+        info: DirInfo,
+        reused: Option<u32>,
+        progress: &ScanProgress,
+    ) {
+        if info.files_cached
+            && let Some(&rec) = self.paths.get(path)
+        {
+            attach_cached_files(nodes, idx, self.prior, rec, progress);
+        }
+        // A pruned directory: rebuild its entire subtree from the index.
+        if let Some(rec) = reused {
+            nodes[idx].mtime_ns = self.prior.dirs[rec as usize].mtime_ns;
+            attach_cached_subtree(nodes, idx, self.prior, &self.kids, rec, progress);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Arena {
+    nodes: Vec<Node>,
+    /// Transient path → index map, used only to wire up parent/child links
+    /// during the build; dropped before the tree is returned.
+    index: HashMap<PathBuf, usize>,
+}
+
+impl Arena {
+    fn node_for(&mut self, p: &Path) -> usize {
+        if let Some(&i) = self.index.get(p) {
+            return i;
+        }
+        let i = self.nodes.len();
+        self.nodes.push(new_dir(file_label(p)));
+        self.index.insert(p.to_path_buf(), i);
+        i
+    }
+
+    fn add(
+        &mut self,
+        entry: &WalkEntry,
+        root: &Path,
+        dir_info: &Mutex<HashMap<PathBuf, DirInfo>>,
+        cached: Option<&CachedTree<'_>>,
+        progress: &ScanProgress,
+    ) {
+        let path = entry.path();
+        let idx = self.node_for(&path);
+        let is_dir = entry.file_type.is_dir();
+        self.nodes[idx].is_dir = is_dir;
+        if !is_dir {
+            self.nodes[idx].size = entry.client_state.size;
+            self.nodes[idx].private = entry.client_state.private;
+            self.nodes[idx].file_count = 1;
+        }
+        if path != root
+            && let Some(parent) = path.parent()
+        {
+            let pidx = self.node_for(parent);
+            self.nodes[idx].parent = Some(pidx);
+            self.nodes[pidx].children.push(idx);
+        }
+        if is_dir {
+            let info = dir_info
+                .lock()
+                .unwrap()
+                .get(&path)
+                .copied()
+                .unwrap_or_default();
+            self.nodes[idx].mtime_ns = info.mtime_ns;
+            if let Some(cached) = cached {
+                cached.attach(
+                    &mut self.nodes,
+                    idx,
+                    &path,
+                    info,
+                    entry.client_state.reused,
+                    progress,
+                );
+            }
+        }
+    }
+}
+
 /// Shared scan implementation. When `interval` is `Some`, a snapshot is published
 /// via `on_snapshot` no more often than that interval; when `None`, snapshots are
 /// never built (so non-streaming callers pay no clone/aggregate cost).
@@ -317,167 +597,48 @@ fn dir_mtime_ns(path: &Path) -> i64 {
 fn scan_impl(
     root: PathBuf,
     progress: Arc<ScanProgress>,
-    mut on_snapshot: impl FnMut(Tree),
+    on_snapshot: impl FnMut(Tree),
     interval: Option<Duration>,
     reuse: Option<Reuse<'_>>,
 ) -> Tree {
-    use jwalk::WalkDirGeneric;
-
-    let prog = progress.clone();
-    let hardlinks: Arc<Mutex<HashSet<(u64, u64)>>> = Arc::new(Mutex::new(HashSet::new()));
-    let hl = hardlinks.clone();
-
-    // Facts about each directory, filled in on the walk threads and read back
-    // when the corresponding node is built. One lock per directory, not per file.
-    let dir_info: Arc<Mutex<HashMap<PathBuf, DirInfo>>> = Arc::new(Mutex::new(HashMap::new()));
-    let di = dir_info.clone();
-    // One device id for the whole walk. Hardlink identity is (device, inode),
-    // and a `stat` per directory just to re-learn the same number is waste.
-    let root_dev = device_of(&root);
-
-    // Read-only lookups shared with the walk threads.
-    let prior_paths: Arc<HashMap<PathBuf, u32>> = Arc::new(match &reuse {
-        Some(r) => r.prior.by_path(),
-        None => HashMap::new(),
+    let reader = DirReader::new(&root, reuse.as_ref(), progress.clone());
+    // The walk closure takes ownership of the reader; the build loop keeps its
+    // own handles on what they share.
+    let dir_info = reader.dir_info.clone();
+    let cached = reuse.as_ref().map(|r| CachedTree {
+        prior: r.prior,
+        paths: reader.prior_paths.clone(),
+        kids: children_of(r.prior),
     });
-    let prior_mtimes: Arc<Vec<i64>> = Arc::new(match &reuse {
-        Some(r) => r.prior.dirs.iter().map(|d| d.mtime_ns).collect(),
-        None => Vec::new(),
-    });
-    let dirty: Option<Arc<HashSet<PathBuf>>> = reuse
-        .as_ref()
-        .and_then(|r| r.dirty_closure)
-        .map(|d| Arc::new(d.clone()));
-    let has_prior = reuse.is_some();
-    // The walk closure takes ownership of one handle; the build loop keeps another.
-    let paths_for_build = prior_paths.clone();
 
-    let walk = WalkDirGeneric::<((), EntryState)>::new(&root)
+    let walk = WalkDirGeneric::<WalkState>::new(&root)
         .skip_hidden(false)
         .follow_links(false)
         .process_read_dir(move |depth, path, _state, children| {
-            // A directory's own mtime was recorded when its parent was read, so
-            // there is no stat here; only the scan root has to be asked directly.
-            let mtime = di
-                .lock()
-                .unwrap()
-                .get(path)
-                .map(|d: &DirInfo| d.mtime_ns)
-                .unwrap_or(0);
-            let mtime = if mtime == 0 {
-                dir_mtime_ns(path)
-            } else {
-                mtime
-            };
-            let rec = prior_paths.get(path).copied();
-            // Same directory, same mtime → its direct entries are unchanged, so
-            // the sizes of its own files can come from the index.
-            let files_cached = has_prior
-                && mtime != 0
-                && rec
-                    .and_then(|ix| prior_mtimes.get(ix as usize).copied())
-                    .is_some_and(|m| m == mtime);
-
-            di.lock().unwrap().insert(
-                path.to_path_buf(),
-                DirInfo {
-                    mtime_ns: mtime,
-                    files_cached,
-                },
-            );
-
-            if files_cached {
-                // Their sizes are served from the index; don't walk or stat them.
-                children.retain(|e| e.as_ref().map(|e| e.file_type.is_dir()).unwrap_or(false));
-            }
-            // jwalk calls this once for the root's parent with `depth == None`
-            // and the root as the only child; filtering there would drop the
-            // root itself and make `scan /Volumes` return an empty tree.
-            if depth.is_some() {
-                children.retain(|e| {
-                    e.as_ref()
-                        .map(|e| !(e.file_type.is_dir() && never_descend(&e.path())))
-                        .unwrap_or(true)
-                });
-            }
-
-            // One `getattrlistbulk` call yields every child's size, replacing a
-            // stat per file — and it is the only source of the private-byte
-            // figure. Falls back to per-file stat where it is unavailable.
-            let bulk: Option<HashMap<String, (u64, u64, u64, u32)>> = if files_cached {
-                None
-            } else {
-                bulkstat::read_dir(path).map(|entries| {
-                    let mut files = HashMap::new();
-                    let mut info = di.lock().unwrap();
-                    for e in entries {
-                        if e.is_file {
-                            files.insert(e.name, (e.allocated, e.private, e.fileid, e.nlink));
-                        } else if e.mtime_ns != 0 {
-                            // Hand each child directory its mtime now, so the
-                            // pass that reads it does not need a stat of its own.
-                            info.entry(path.join(&e.name)).or_insert(DirInfo {
-                                mtime_ns: e.mtime_ns,
-                                files_cached: false,
-                            });
-                        }
-                    }
-                    files
-                })
-            };
-            let dev = root_dev;
-
-            for entry in children.iter_mut().flatten() {
-                if entry.file_type.is_dir() {
-                    // A directory with no changed path at or below it can be served
-                    // whole from the index — don't descend.
-                    if let Some(dirty) = &dirty {
-                        let child_path = entry.path();
-                        if !dirty.contains(&child_path)
-                            && let Some(&ix) = prior_paths.get(&child_path)
-                        {
-                            entry.client_state.reused = Some(ix);
-                            entry.read_children_path = None;
-                        }
-                    }
-                } else if entry.file_type.is_file() {
-                    let name = entry.file_name.to_string_lossy();
-                    let sized = match bulk.as_ref().and_then(|m| m.get(name.as_ref())) {
-                        Some(&(alloc, private, ino, nlink)) => {
-                            Some(dedup_hardlink(alloc, private, dev, ino, nlink, &hl))
-                        }
-                        None => std::fs::symlink_metadata(entry.path())
-                            .ok()
-                            .map(|md| counted_size(&md, &hl)),
-                    };
-                    if let Some((sz, priv_sz)) = sized {
-                        entry.client_state.size = sz;
-                        entry.client_state.private = priv_sz;
-                        prog.files.fetch_add(1, Ordering::Relaxed);
-                        prog.bytes.fetch_add(sz, Ordering::Relaxed);
-                    }
-                }
-            }
+            reader.read_dir(depth, path, children);
         });
 
-    let mut nodes: Vec<Node> = Vec::new();
-    // Transient path → index map, used only to wire up parent/child links during
-    // the build; dropped before the tree is returned.
-    let mut index: HashMap<PathBuf, usize> = HashMap::new();
-    // Child adjacency over the cached index, built once and only when reusing.
-    let prior_kids: Option<Vec<Vec<u32>>> = reuse.as_ref().map(|r| children_of(r.prior));
+    build_tree(
+        root,
+        walk,
+        dir_info,
+        cached,
+        progress,
+        on_snapshot,
+        interval,
+    )
+}
 
-    let get_or_create =
-        |nodes: &mut Vec<Node>, index: &mut HashMap<PathBuf, usize>, p: &Path| -> usize {
-            if let Some(&i) = index.get(p) {
-                return i;
-            }
-            let i = nodes.len();
-            nodes.push(new_dir(file_label(p)));
-            index.insert(p.to_path_buf(), i);
-            i
-        };
-
+fn build_tree(
+    root: PathBuf,
+    walk: WalkDirGeneric<WalkState>,
+    dir_info: Arc<Mutex<HashMap<PathBuf, DirInfo>>>,
+    cached: Option<CachedTree<'_>>,
+    progress: Arc<ScanProgress>,
+    mut on_snapshot: impl FnMut(Tree),
+    interval: Option<Duration>,
+) -> Tree {
+    let mut arena = Arena::default();
     let mut last_snapshot = Instant::now();
     for entry in walk {
         let entry = match entry {
@@ -490,58 +651,22 @@ fn scan_impl(
         if entry.read_children_error.is_some() {
             progress.unreadable.fetch_add(1, Ordering::Relaxed);
         }
-        let path = entry.path();
-        let idx = get_or_create(&mut nodes, &mut index, &path);
-        let is_dir = entry.file_type.is_dir();
-        nodes[idx].is_dir = is_dir;
-        if !is_dir {
-            nodes[idx].size = entry.client_state.size;
-            nodes[idx].private = entry.client_state.private;
-            nodes[idx].file_count = 1;
-        }
-        if path != root
-            && let Some(parent) = path.parent()
-        {
-            let pidx = get_or_create(&mut nodes, &mut index, parent);
-            nodes[idx].parent = Some(pidx);
-            nodes[pidx].children.push(idx);
-        }
-
-        if is_dir && let Some(r) = &reuse {
-            let info = dir_info.lock().unwrap().get(&path).copied();
-            if let Some(info) = info {
-                nodes[idx].mtime_ns = info.mtime_ns;
-                if info.files_cached
-                    && let Some(&rec) = paths_for_build.get(&path)
-                {
-                    attach_cached_files(&mut nodes, idx, r.prior, rec, &progress);
-                }
-            }
-            // A pruned directory: rebuild its entire subtree from the index.
-            if let Some(rec) = entry.client_state.reused
-                && let Some(kids) = &prior_kids
-            {
-                nodes[idx].mtime_ns = r.prior.dirs[rec as usize].mtime_ns;
-                attach_cached_subtree(&mut nodes, idx, r.prior, kids, rec, &progress);
-            }
-        } else if is_dir && let Some(info) = dir_info.lock().unwrap().get(&path) {
-            nodes[idx].mtime_ns = info.mtime_ns;
-        }
+        arena.add(&entry, &root, &dir_info, cached.as_ref(), &progress);
 
         // Periodically hand the UI a browsable snapshot of what we have so far.
         // Skipped entirely (no clone/aggregate cost) for non-streaming callers.
         if let Some(iv) = interval
             && last_snapshot.elapsed() >= iv
-            && let Some(&ri) = index.get(&root)
+            && let Some(&ri) = arena.index.get(&root)
         {
-            on_snapshot(snapshot(&nodes, ri, &root));
+            on_snapshot(snapshot(&arena.nodes, ri, &root));
             last_snapshot = Instant::now();
         }
     }
 
+    let Arena { mut nodes, index } = arena;
     if nodes.is_empty() {
         nodes.push(new_dir(file_label(&root)));
-        index.insert(root.clone(), 0);
     }
     let root_idx = *index.get(&root).unwrap_or(&0);
     drop(index); // free the transient path map before we return the tree
