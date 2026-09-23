@@ -4,8 +4,9 @@
 //! Every listing command takes `--json`, because the most common non-human
 //! caller is a coding agent that would otherwise have to parse columns.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use serde_json::{Value, json};
 
@@ -15,7 +16,7 @@ use crate::engine::{self, Freshness};
 use crate::index::Index;
 use crate::live;
 use crate::registration;
-use crate::scan::ScanProgress;
+use crate::scan::{FULL_DISK_ACCESS_HINT, ScanProgress};
 use crate::util;
 
 pub const USAGE: &str = "\
@@ -147,12 +148,9 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
     } else {
         Freshness::Auto
     };
-    let r = engine::refresh(
-        root.clone(),
-        freshness,
-        Arc::new(ScanProgress::default()),
-        |_| {},
-    );
+    let progress = Arc::new(ScanProgress::default());
+    let r = engine::refresh(root.clone(), freshness, progress.clone(), |_| {});
+    let unreadable = progress.unreadable.load(Ordering::Relaxed);
     let hits = caches::detect_in_index(&r.index);
     let refs = live::Refs::collect();
     // Reclaimable counts only what deleting would really free: the private
@@ -186,6 +184,7 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
         "mode": r.mode.as_str(),
         "why": r.reason,
         "changed_dirs": r.changed_dirs,
+        "unreadable_dirs": unreadable,
         "index_saved": r.saved,
         "largest": hits.iter().take(25).map(|h| json!({
             "path": h.path.to_string_lossy(),
@@ -202,14 +201,22 @@ fn cmd_scan(a: &Args) -> Result<(), String> {
 
     emit(a.json, &value, || {
         println!(
-            "\n{}\n  {} across {} files in {:.2}s  [{}: {}]\n",
+            "\n{}\n  {} across {} files in {:.2}s  [{}: {}]{}\n",
             root.display(),
             util::human(total),
             r.index.total_files(),
             r.secs,
             r.mode.as_str(),
-            r.reason
+            r.reason,
+            if unreadable > 0 {
+                format!("  {unreadable} unreadable dirs")
+            } else {
+                String::new()
+            }
         );
+        if unreadable > 0 && root == Path::new("/") {
+            println!("{FULL_DISK_ACCESS_HINT}\n");
+        }
         println!(
             "Dev caches: {} reclaimable across {} dirs  ({} apparent{})",
             util::human(reclaimable),

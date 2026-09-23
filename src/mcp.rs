@@ -16,10 +16,19 @@
 //! `scanned_at`, `age_seconds` and `mode` so the caller knows how old the
 //! numbers are — and [`crate::cleanup`] re-checks the filesystem before deleting
 //! anything, so acting on a stale read still cannot delete the wrong thing.
+//!
+//! Scans run as background jobs, one per root, because a whole-disk scan takes
+//! minutes and an MCP client gives up on a tool call after about a minute:
+//! `ds_scan` waits a bounded time, then reports progress and lets the caller
+//! ask again while the scan keeps going.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -27,7 +36,7 @@ use crate::caches;
 use crate::cleanup;
 use crate::engine::{self, Freshness};
 use crate::index::Index;
-use crate::scan::ScanProgress;
+use crate::scan::{FULL_DISK_ACCESS_HINT, ScanProgress};
 use crate::util;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -37,12 +46,45 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MAX_ROWS: usize = 500;
 const DEFAULT_ROWS: usize = 30;
 
+/// How long `ds_scan` waits for the scan before answering with progress.
+/// The cap stays under the roughly 60 s after which MCP clients give up.
+const DEFAULT_WAIT_SECS: u64 = 20;
+const MAX_WAIT_SECS: u64 = 55;
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A scan in flight on its own thread. The thread hands back the result JSON
+/// only: a whole-disk tree is gigabytes, so it builds the summary and drops the
+/// tree before it exits, and reads go to the saved index like every other tool.
+struct Scan {
+    progress: Arc<ScanProgress>,
+    started: Instant,
+    handle: JoinHandle<Value>,
+}
+
+/// Everything the server remembers between requests: the scans still running,
+/// keyed by root. A root is absent once its scan has been joined.
+#[derive(Default)]
+struct Server {
+    scans: BTreeMap<PathBuf, Scan>,
+}
+
+impl Server {
+    /// The running scan whose root contains `path`, if any.
+    fn scan_covering(&self, path: &Path) -> Option<(&Path, &Scan)> {
+        self.scans
+            .iter()
+            .find(|(root, _)| path.starts_with(root))
+            .map(|(root, scan)| (root.as_path(), scan))
+    }
+}
+
 /// Run the server until stdin closes.
 pub fn serve() -> std::io::Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let mut line = String::new();
     let mut reader = stdin.lock();
+    let mut server = Server::default();
 
     loop {
         line.clear();
@@ -75,7 +117,7 @@ pub fn serve() -> std::io::Result<()> {
         };
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let params = req.get("params").cloned().unwrap_or(Value::Null);
-        let response = match dispatch(method, &params) {
+        let response = match dispatch(&mut server, method, &params) {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err(err) => json!({"jsonrpc": "2.0", "id": id, "error": err.to_json()}),
         };
@@ -112,7 +154,7 @@ impl RpcError {
     }
 }
 
-fn dispatch(method: &str, params: &Value) -> Result<Value, RpcError> {
+fn dispatch(server: &mut Server, method: &str, params: &Value) -> Result<Value, RpcError> {
     match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -121,7 +163,7 @@ fn dispatch(method: &str, params: &Value) -> Result<Value, RpcError> {
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tool_definitions()})),
-        "tools/call" => call_tool(params),
+        "tools/call" => call_tool(server, params),
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -147,13 +189,19 @@ fn tool_definitions() -> Vec<Value> {
                             it can (FSEvents tells it what changed), so a repeat scan is fast. \
                             Pass mode='full' to re-stat everything, which is the way to correct \
                             sizes of files that grew in place. This is the only tool that touches \
-                            the whole filesystem; the read tools are served from the index.",
+                            the whole filesystem; the read tools are served from the index. \
+                            The whole disk ('/') works. A scan runs in the background: when it \
+                            outlasts wait_seconds the result has status 'running' with progress \
+                            so far, and calling again with the same path keeps waiting for it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "path": path_prop("Absolute path of the folder to scan."),
                     "mode": {"type": "string", "enum": ["auto", "full"],
                              "description": "auto (default) reuses the cached index; full rescans everything."},
+                    "wait_seconds": {"type": "integer",
+                                     "description": "How long to wait for the scan before answering with \
+                                                     progress (default 20, max 55)."},
                 },
                 "required": ["path"],
             },
@@ -231,7 +279,7 @@ fn tool_definitions() -> Vec<Value> {
 
 // ---- dispatch ---------------------------------------------------------------
 
-fn call_tool(params: &Value) -> Result<Value, RpcError> {
+fn call_tool(server: &mut Server, params: &Value) -> Result<Value, RpcError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -239,12 +287,12 @@ fn call_tool(params: &Value) -> Result<Value, RpcError> {
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let body = match name {
-        "ds_status" => tool_status(),
-        "ds_scan" => tool_scan(&args),
-        "ds_caches" => tool_caches(&args),
-        "ds_top" => tool_top(&args),
-        "ds_tree" => tool_tree(&args),
-        "ds_trash" => tool_trash(&args),
+        "ds_status" => tool_status(server),
+        "ds_scan" => tool_scan(server, &args),
+        "ds_caches" => tool_caches(server, &args),
+        "ds_top" => tool_top(server, &args),
+        "ds_tree" => tool_tree(server, &args),
+        "ds_trash" => tool_trash(server, &args),
         other => return Err(RpcError::invalid(format!("unknown tool: {other}"))),
     };
 
@@ -295,12 +343,32 @@ fn resolve_arg_path(raw: &str) -> PathBuf {
     }
 }
 
-fn index_for(path: &Path) -> Result<Index, String> {
-    engine::index_covering(path).ok_or_else(|| {
-        format!(
+fn index_for(server: &Server, path: &Path) -> Result<Index, String> {
+    engine::index_covering(path).ok_or_else(|| match server.scan_covering(path) {
+        Some((root, scan)) => format!(
+            "No index covers {} yet: a scan of {} is running ({} files, {} so far). \
+             Call ds_scan on it to wait for the result.",
+            path.display(),
+            root.display(),
+            scan.progress.files.load(Ordering::Relaxed),
+            util::human(scan.progress.bytes.load(Ordering::Relaxed)),
+        ),
+        None => format!(
             "No index covers {}. Run ds_scan on it (or on a parent folder) first.",
             path.display()
-        )
+        ),
+    })
+}
+
+/// Progress of a running scan, in the shape both `ds_scan` and `ds_status` report.
+fn progress_of(root: &Path, scan: &Scan) -> Value {
+    let bytes = scan.progress.bytes.load(Ordering::Relaxed);
+    json!({
+        "root": root.to_string_lossy(),
+        "files_so_far": scan.progress.files.load(Ordering::Relaxed),
+        "bytes_so_far": bytes,
+        "bytes_so_far_human": util::human(bytes),
+        "elapsed_seconds": scan.started.elapsed().as_secs(),
     })
 }
 
@@ -331,7 +399,7 @@ fn human_age(secs: u64) -> String {
 
 // ---- tools ------------------------------------------------------------------
 
-fn tool_status() -> Result<Value, String> {
+fn tool_status(server: &Server) -> Result<Value, String> {
     let roots: Vec<Value> = engine::cached_roots()
         .iter()
         .map(|idx| {
@@ -363,18 +431,24 @@ fn tool_status() -> Result<Value, String> {
     // How this server is wired in. `sessions` counts this process too, so a
     // lone caller sees 1 rather than 0.
     let mcp = crate::registration::Status::collect().to_json();
+    let running: Vec<Value> = server
+        .scans
+        .iter()
+        .map(|(root, scan)| progress_of(root, scan))
+        .collect();
 
     if roots.is_empty() {
         return Ok(json!({
             "indexed_roots": [],
+            "running_scans": running,
             "hint": "Nothing indexed yet. Call ds_scan with a path such as the user's home or project folder.",
             "mcp": mcp,
         }));
     }
-    Ok(json!({"indexed_roots": roots, "mcp": mcp}))
+    Ok(json!({"indexed_roots": roots, "running_scans": running, "mcp": mcp}))
 }
 
-fn tool_scan(args: &Value) -> Result<Value, String> {
+fn tool_scan(server: &mut Server, args: &Value) -> Result<Value, String> {
     let raw = arg_str(args, "path").ok_or("path is required")?;
     let root = resolve_arg_path(&raw);
     if !root.is_dir() {
@@ -384,13 +458,64 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         Some("full") => Freshness::Full,
         _ => Freshness::Auto,
     };
+    let wait = args
+        .get("wait_seconds")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_WAIT_SECS, |n| n.min(MAX_WAIT_SECS));
 
-    let result = engine::refresh(
-        root.clone(),
-        freshness,
-        Arc::new(ScanProgress::default()),
-        |_| {},
-    );
+    // Re-attach to a scan already running on this root rather than start a
+    // second one.
+    let scan = match server.scans.remove(&root) {
+        Some(scan) => scan,
+        None => start_scan(root.clone(), freshness)?,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    while !scan.handle.is_finished() {
+        if Instant::now() >= deadline {
+            let mut v = progress_of(&root, &scan);
+            v["status"] = json!("running");
+            v["hint"] = json!(
+                "Call ds_scan again with the same path to wait more; the scan keeps running."
+            );
+            server.scans.insert(root, scan);
+            return Ok(v);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+
+    match scan.handle.join() {
+        Ok(result) => Ok(result),
+        Err(payload) => Err(format!(
+            "scan of {} panicked: {}",
+            root.display(),
+            panic_message(&*payload)
+        )),
+    }
+}
+
+fn start_scan(root: PathBuf, freshness: Freshness) -> Result<Scan, String> {
+    let progress = Arc::new(ScanProgress::default());
+    let handle = std::thread::Builder::new()
+        .name(format!("scan {}", root.display()))
+        .spawn({
+            let progress = progress.clone();
+            move || scan_result(root, freshness, progress)
+        })
+        .map_err(|e| format!("could not start the scan thread: {e}"))?;
+    Ok(Scan {
+        progress,
+        started: Instant::now(),
+        handle,
+    })
+}
+
+/// Run the scan to completion and summarise it. The `Refreshed` (and the tree
+/// inside it) is dropped here, on the scan thread, so only the summary outlives
+/// the walk.
+fn scan_result(root: PathBuf, freshness: Freshness, progress: Arc<ScanProgress>) -> Value {
+    let result = engine::refresh(root.clone(), freshness, progress.clone(), |_| {});
+    let unreadable = progress.unreadable.load(Ordering::Relaxed);
     let hits = caches::detect_in_index(&result.index);
     let refs = crate::live::Refs::collect();
     let reclaimable: u64 = hits
@@ -399,7 +524,8 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         .map(|h| h.private)
         .sum();
 
-    Ok(json!({
+    let mut v = json!({
+        "status": "done",
         "root": root.to_string_lossy(),
         "total_bytes": result.index.total_bytes(),
         "total_human": util::human(result.index.total_bytes()),
@@ -411,8 +537,40 @@ fn tool_scan(args: &Value) -> Result<Value, String> {
         "mode": result.mode.as_str(),
         "why": result.reason,
         "changed_dirs": result.changed_dirs,
+        "unreadable_dirs": unreadable,
         "index_saved": result.saved,
-    }))
+    });
+    if unreadable > 0 && root == Path::new("/") {
+        v["hint"] = json!(FULL_DISK_ACCESS_HINT);
+    }
+    drop(result);
+    return_freed_memory();
+    v
+}
+
+/// Hand the pages a finished scan freed back to the kernel. macOS malloc keeps
+/// them mapped for reuse, so without this a server that just walked a disk
+/// stays at gigabytes of RSS while it idles.
+#[cfg(target_os = "macos")]
+fn return_freed_memory() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    // A null zone means every zone; a zero goal means as much as possible.
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn return_freed_memory() {}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// Match a user-supplied ecosystem filter against a category label.
@@ -432,10 +590,10 @@ fn category_matches(filter: &str, c: caches::Category) -> bool {
         )
 }
 
-fn tool_caches(args: &Value) -> Result<Value, String> {
+fn tool_caches(server: &Server, args: &Value) -> Result<Value, String> {
     let raw = arg_str(args, "path").ok_or("path is required")?;
     let path = resolve_arg_path(&raw);
-    let idx = index_for(&path)?;
+    let idx = index_for(server, &path)?;
     let limit = arg_limit(args);
     let min_bytes = args.get("min_bytes").and_then(Value::as_u64).unwrap_or(0);
     let category = arg_str(args, "category");
@@ -518,10 +676,10 @@ fn node_at(tree: &crate::scan::Tree, path: &Path) -> Option<usize> {
     Some(cur)
 }
 
-fn tool_top(args: &Value) -> Result<Value, String> {
+fn tool_top(server: &Server, args: &Value) -> Result<Value, String> {
     let raw = arg_str(args, "path").ok_or("path is required")?;
     let path = resolve_arg_path(&raw);
-    let idx = index_for(&path)?;
+    let idx = index_for(server, &path)?;
     let limit = arg_limit(args);
     let dirs_only = arg_bool(args, "dirs_only");
 
@@ -578,10 +736,10 @@ fn tool_top(args: &Value) -> Result<Value, String> {
     }))
 }
 
-fn tool_tree(args: &Value) -> Result<Value, String> {
+fn tool_tree(server: &Server, args: &Value) -> Result<Value, String> {
     let raw = arg_str(args, "path").ok_or("path is required")?;
     let path = resolve_arg_path(&raw);
-    let idx = index_for(&path)?;
+    let idx = index_for(server, &path)?;
     let limit = arg_limit(args);
 
     let tree = crate::index::to_tree(&idx);
@@ -622,7 +780,7 @@ fn tool_tree(args: &Value) -> Result<Value, String> {
     }))
 }
 
-fn tool_trash(args: &Value) -> Result<Value, String> {
+fn tool_trash(server: &Server, args: &Value) -> Result<Value, String> {
     let raw = args
         .get("paths")
         .and_then(Value::as_array)
@@ -641,7 +799,7 @@ fn tool_trash(args: &Value) -> Result<Value, String> {
 
     // Every target must live under one indexed root; that root is the boundary
     // all the structural guards are measured against.
-    let idx = index_for(&paths[0])?;
+    let idx = index_for(server, &paths[0])?;
     let root = idx.root.clone();
     let allow_any = arg_bool(args, "allow_any");
     let confirm = arg_bool(args, "confirm");
@@ -717,7 +875,8 @@ mod tests {
 
     #[test]
     fn initialize_reports_a_tools_capability() {
-        let r = dispatch("initialize", &Value::Null).expect("initialize");
+        let mut server = Server::default();
+        let r = dispatch(&mut server, "initialize", &Value::Null).expect("initialize");
         assert_eq!(r["protocolVersion"], PROTOCOL_VERSION);
         assert!(r["capabilities"]["tools"].is_object());
         assert_eq!(r["serverInfo"]["name"], "diskscour");
@@ -736,9 +895,22 @@ mod tests {
 
     #[test]
     fn unknown_method_and_tool_are_reported_distinctly() {
-        assert_eq!(dispatch("nope", &Value::Null).err().unwrap().code, -32601);
+        let mut server = Server::default();
+        assert_eq!(
+            dispatch(&mut server, "nope", &Value::Null)
+                .err()
+                .unwrap()
+                .code,
+            -32601
+        );
         let call = json!({"name": "ds_nope", "arguments": {}});
-        assert_eq!(dispatch("tools/call", &call).err().unwrap().code, -32602);
+        assert_eq!(
+            dispatch(&mut server, "tools/call", &call)
+                .err()
+                .unwrap()
+                .code,
+            -32602
+        );
     }
 
     #[test]
@@ -746,7 +918,8 @@ mod tests {
         // Tool-level failures must come back as content so the agent can read
         // them, not as JSON-RPC errors that it cannot act on.
         let call = json!({"name": "ds_caches", "arguments": {"path": "/definitely/not/here"}});
-        let r = dispatch("tools/call", &call).expect("dispatch should succeed");
+        let r =
+            dispatch(&mut Server::default(), "tools/call", &call).expect("dispatch should succeed");
         assert_eq!(r["isError"], true);
         assert!(
             r["content"][0]["text"]
@@ -759,7 +932,7 @@ mod tests {
     #[test]
     fn trash_without_confirm_never_reports_a_deletion() {
         let call = json!({"name": "ds_trash", "arguments": {"paths": ["/tmp/does-not-exist-xyz"]}});
-        let r = dispatch("tools/call", &call).expect("dispatch");
+        let r = dispatch(&mut Server::default(), "tools/call", &call).expect("dispatch");
         let text = r["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("\"confirmed\": true"));
     }
