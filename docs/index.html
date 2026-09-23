@@ -414,8 +414,8 @@ footer {
 </div>
 <script>
 document.querySelector('.copy').addEventListener('click', async function () {
-  try { await navigator.clipboard.writeText(this.dataset.cmd); } catch (e) { return; }
-  this.textContent = 'Copied';
+  const copied = await navigator.clipboard.writeText(this.dataset.cmd).then(() => true, () => false);
+  this.textContent = copied ? 'Copied' : 'Press \u2318C';
   setTimeout(() => { this.textContent = 'Copy'; }, 2000);
 });
 </script>
